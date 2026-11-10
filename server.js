@@ -1,5 +1,6 @@
 // RentRoll server (Sprint 1: data model, dashboard, sandbox capture, webhook ledger;
-// Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js).
+// Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js;
+// Sprint 3: landlord approval turns the plan into a server-enforced payment constraint, see approvePlan()).
 //
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
@@ -171,6 +172,12 @@ function migrate(d) {
   const msgCols = d.prepare('PRAGMA table_info(message)').all().map((c) => c.name);
   if (!msgCols.includes('rent_period_id')) d.exec('ALTER TABLE message ADD COLUMN rent_period_id INTEGER REFERENCES rent_period(id)');
   d.exec('CREATE INDEX IF NOT EXISTS plan_period ON plan(rent_period_id)');
+  // Sprint 3: a payment made under an approved plan records which plan + installment (1-based) it satisfies.
+  const payCols = d.prepare('PRAGMA table_info(payment)').all().map((c) => c.name);
+  if (!payCols.includes('plan_id')) d.exec('ALTER TABLE payment ADD COLUMN plan_id INTEGER REFERENCES plan(id)');
+  if (!payCols.includes('plan_installment')) d.exec('ALTER TABLE payment ADD COLUMN plan_installment INTEGER');
+  // At most one approved (= enforced) plan per rent period, guaranteed by the DB, not just the handler.
+  d.exec("CREATE UNIQUE INDEX IF NOT EXISTS plan_one_approved ON plan(rent_period_id) WHERE status = 'approved'");
 }
 // node:sqlite has no transaction helper; BEGIN IMMEDIATE serialises writers (also across processes).
 function tx(d, fn) {
@@ -259,16 +266,28 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
     const pending = d.prepare("SELECT COALESCE(SUM(amount_cents),0) s FROM payment WHERE rent_period_id=? AND status='PENDING'").get(rpId).s;
     const open = rp.amount_due_cents - rp.amount_paid_cents - pending;
     if (open <= 0) throw new HttpError(409, `${rp.unit_label} ${rp.period} has no open balance`);
-    if (amountCents > open) throw new HttpError(422, `amount ${money(amountCents)} exceeds open balance ${money(open)}`);
-    const idx = d.prepare("SELECT COUNT(*) n FROM payment WHERE rent_period_id=? AND status IN ('COMPLETED','PENDING')").get(rpId).n + 1;
+    // Sprint 3 write-back: an approved plan replaces "any amount up to the balance" with "exactly the next installment".
+    const planRow = activePlanRow(d, rp.id);
+    let idx, planId = null;
+    if (planRow) {
+      const sch = planSchedule(d, planRow);
+      if (sch.blocked_by_processing) throw new HttpError(409, `approved plan #${planRow.id}: installment ${sch.blocked_by_processing.n} of ${sch.blocked_by_processing.of} is still processing at PayPal`);
+      const nx = sch.next_installment;
+      if (!nx) throw new HttpError(409, `approved plan #${planRow.id} has no unpaid installment`);
+      if (amountCents !== nx.amount_cents) throw new HttpError(422, `approved plan #${planRow.id} only accepts installment ${nx.n} of ${nx.of}: exactly ${money(nx.amount_cents)} (due ${nx.due_date}). ${money(amountCents)} refused`);
+      idx = nx.n; planId = planRow.id;
+    } else {
+      if (amountCents > open) throw new HttpError(422, `amount ${money(amountCents)} exceeds open balance ${money(open)}`);
+      idx = d.prepare("SELECT COUNT(*) n FROM payment WHERE rent_period_id=? AND status IN ('COMPLETED','PENDING')").get(rpId).n + 1;
+    }
     const nonce = randomUUID().slice(0, 8);
     const customId = `RR:rp${rp.id}:${rp.period}:u${rp.unit_id}:i${idx}:${nonce}`;
     const requestId = `rr-${rp.id}-${idx}-${randomUUID()}`;
-    const payId = Number(d.prepare(`INSERT INTO payment (rent_period_id, installment_index, source, status, amount_cents, custom_id, paypal_request_id)
-      VALUES (?,?,?,?,?,?,?)`).run(rp.id, idx, 'paypal_capture', 'PENDING', amountCents, customId, requestId).lastInsertRowid);
-    return { rp, idx, customId, requestId, payId };
+    const payId = Number(d.prepare(`INSERT INTO payment (rent_period_id, installment_index, source, status, amount_cents, custom_id, paypal_request_id, plan_id, plan_installment)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(rp.id, idx, 'paypal_capture', 'PENDING', amountCents, customId, requestId, planId, planId ? idx : null).lastInsertRowid);
+    return { rp, idx, customId, requestId, payId, planId, planOf: planRow ? JSON.parse(planRow.installments_json).length : null };
   });
-  const { rp, idx, customId, requestId, payId } = attempt;
+  const { rp, idx, customId, requestId, payId, planId, planOf } = attempt;
 
   // 2. Create + capture in one call (intent CAPTURE + payment_source.card).
   let r;
@@ -307,10 +326,13 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
         paid_at=COALESCE(paid_at, ?) WHERE id=?`)
       .run(status, order.id, cap.id, r.debug_id, fee, net, status === 'COMPLETED' ? (cap.create_time || new Date().toISOString()) : null, payId);
     const s = recompute(d, rp.id);
+    const planStatus = settlePlan(d, planId);
     logEvent(d, { kind: 'payment', actor: 'tenant', rent_period_id: rp.id,
-      summary: `${rp.tenant_name} paid ${money(amountCents)} by card through PayPal (capture ${cap.id}, ${cap.status}). Balance now ${money(s.balance_cents)}`,
-      payload: { payment_id: payId, order_id: order.id, capture_id: cap.id, capture_status: cap.status, fee_cents: fee, net_cents: net, custom_id: customId } });
-    return { payment: d.prepare('SELECT * FROM payment WHERE id=?').get(payId), rent_period: s };
+      summary: `${rp.tenant_name} paid ${money(amountCents)} by card through PayPal${planId ? ` (plan #${planId}, installment ${idx} of ${planOf})` : ''} (capture ${cap.id}, ${cap.status}). Balance now ${money(s.balance_cents)}`,
+      payload: { payment_id: payId, order_id: order.id, capture_id: cap.id, capture_status: cap.status, fee_cents: fee, net_cents: net, custom_id: customId,
+        plan_id: planId, plan_installment: planId ? idx : null } });
+    return { payment: d.prepare('SELECT * FROM payment WHERE id=?').get(payId), rent_period: s,
+      plan: planId ? planOut(d, d.prepare('SELECT * FROM plan WHERE id=?').get(planId)) : null, plan_status: planStatus };
   });
 }
 
@@ -322,6 +344,104 @@ function planView(row) {
     installments: j(row.installments_json, []), reasoning: row.ai_rationale, validation_errors: j(row.validation_json, []),
     ledger_snapshot: j(row.ledger_snapshot_json, null), llm: j(row.llm_meta_json, null), raw_response: row.raw_response,
     created_at: row.created_at };
+}
+
+// ───────────────────────────── approve → write (Sprint 3) ─────────────────────────────
+// Approving a plan is a server-enforced constraint, not a label: while a rent period has an `approved` plan,
+// payRentPeriodSandbox() refuses every amount except the next unpaid installment's exact amount.
+const activePlanRow = (d, rpId) => d.prepare("SELECT * FROM plan WHERE rent_period_id=? AND status='approved'").get(rpId);
+
+// Per-installment state, derived from payments linked to the plan (payment.plan_id + plan_installment).
+function planSchedule(d, planRow) {
+  const inst = JSON.parse(planRow.installments_json || '[]');
+  const pays = d.prepare("SELECT * FROM payment WHERE plan_id=? AND status IN ('COMPLETED','PENDING') ORDER BY id").all(planRow.id);
+  let next = null;
+  const rows = inst.map((x, i) => {
+    const n = i + 1;
+    const done = pays.find((p) => p.plan_installment === n && p.status === 'COMPLETED');
+    const pend = pays.find((p) => p.plan_installment === n && p.status === 'PENDING');
+    let state = done ? 'PAID' : pend ? 'PROCESSING' : null;
+    if (!state) {
+      if (!next) { next = n; state = x.due_date < today() ? 'OVERDUE' : 'DUE'; } else state = 'UPCOMING';
+    }
+    return { n, of: inst.length, due_date: x.due_date, amount_cents: x.amount_cents, note: x.note ?? null, state,
+      payment_id: (done || pend)?.id ?? null, paypal_capture_id: (done || pend)?.paypal_capture_id ?? null,
+      webhook_confirmed: !!done?.webhook_event_id,
+      label: `installment ${n} of ${inst.length}: ${done ? 'PAID' : pend ? 'PROCESSING' : `${state === 'UPCOMING' ? 'upcoming' : state === 'OVERDUE' ? 'OVERDUE since' : 'due'} ${x.due_date}`} (${money(x.amount_cents)})` };
+  });
+  const firstOpen = rows.find((r) => r.state !== 'PAID');
+  return { installments: rows, next_installment: next ? rows[next - 1] : null, blocked_by_processing: firstOpen?.state === 'PROCESSING' ? firstOpen : null,
+    paid_cents: rows.filter((r) => r.state === 'PAID').reduce((a, r) => a + r.amount_cents, 0),
+    all_paid: rows.length > 0 && rows.every((r) => r.state === 'PAID') };
+}
+
+// After any payment state change: an approved plan whose installments are all PAID becomes `completed`.
+function settlePlan(d, planId) {
+  if (!planId) return null;
+  const row = d.prepare('SELECT * FROM plan WHERE id=?').get(planId);
+  if (!row || row.status !== 'approved') return row?.status ?? null;
+  if (!planSchedule(d, row).all_paid) return 'approved';
+  d.prepare("UPDATE plan SET status='completed' WHERE id=?").run(planId);
+  logEvent(d, { kind: 'plan_completed', actor: 'system', rent_period_id: row.rent_period_id,
+    summary: `Payment plan #${planId} completed: every installment paid through PayPal`, payload: { plan_id: planId } });
+  return 'completed';
+}
+
+function approvePlan(d, planId) {
+  return tx(d, () => {
+    const row = d.prepare('SELECT * FROM plan WHERE id=?').get(planId);
+    if (!row) throw new HttpError(404, `plan ${planId} not found`);
+    if (row.status !== 'proposed') throw new HttpError(409, `plan ${planId} is ${row.status}; only a proposed plan can be approved`);
+    const other = activePlanRow(d, row.rent_period_id);
+    if (other) throw new HttpError(409, `plan ${other.id} is already approved for this rent period; reject it first`);
+    // Re-check against the ledger NOW, not at proposal time: money may have moved since the AI proposed.
+    const snap = ledgerSnapshot(d, row.rent_period_id, today());
+    const open = snap.outstanding_cents - snap.pending_cents;
+    const inst = JSON.parse(row.installments_json || '[]');
+    const sum = inst.reduce((a, x) => a + x.amount_cents, 0);
+    if (sum !== open) throw new HttpError(409, `plan ${planId} totals ${money(sum)} but the ledger's open balance is now ${money(open)}; it is stale, ask the tenant again`);
+    const now = new Date().toISOString();
+    d.prepare("UPDATE plan SET status='approved', approved_at=? WHERE id=?").run(now, planId);
+    const superseded = d.prepare("SELECT id FROM plan WHERE rent_period_id=? AND id<>? AND status IN ('proposed','needs_review','parse_failed')").all(row.rent_period_id, planId).map((r) => r.id);
+    for (const id of superseded) d.prepare("UPDATE plan SET status='rejected' WHERE id=?").run(id);
+    const rp = getPeriod(d, row.rent_period_id);
+    logEvent(d, { kind: 'plan_approved', actor: 'landlord', rent_period_id: rp.id,
+      summary: `Landlord approved plan #${planId} for ${rp.tenant_name}: ${inst.map((x, i) => `#${i + 1} ${money(x.amount_cents)} by ${x.due_date}`).join(', ')}. PayPal payments now only accepted for the next installment's exact amount`,
+      payload: { plan_id: planId, installments: inst, open_balance_cents: open, superseded_plan_ids: superseded } });
+    return { plan: planOut(d, d.prepare('SELECT * FROM plan WHERE id=?').get(planId)), superseded_plan_ids: superseded };
+  });
+}
+
+function rejectPlan(d, planId) {
+  return tx(d, () => {
+    const row = d.prepare('SELECT * FROM plan WHERE id=?').get(planId);
+    if (!row) throw new HttpError(404, `plan ${planId} not found`);
+    if (!['proposed', 'needs_review', 'parse_failed', 'approved'].includes(row.status)) throw new HttpError(409, `plan ${planId} is ${row.status}; nothing to reject`);
+    if (row.status === 'approved' && planSchedule(d, row).installments.some((x) => x.state === 'PROCESSING'))
+      throw new HttpError(409, `plan ${planId} has a payment processing at PayPal; wait for it before cancelling`);
+    d.prepare("UPDATE plan SET status='rejected' WHERE id=?").run(planId);
+    const rp = getPeriod(d, row.rent_period_id);
+    logEvent(d, { kind: 'plan_rejected', actor: 'landlord', rent_period_id: rp.id,
+      summary: row.status === 'approved'
+        ? `Landlord cancelled approved plan #${planId}. ${rp.tenant_name} can again pay any amount up to the balance`
+        : `Landlord rejected plan #${planId}. The tenant can be asked for a new proposal`,
+      payload: { plan_id: planId, status_before: row.status } });
+    return { plan: planOut(d, d.prepare('SELECT * FROM plan WHERE id=?').get(planId)) };
+  });
+}
+
+// planView + approval data + live installment schedule (for plans that were ever approved).
+function planOut(d, row) {
+  const v = planView(row);
+  if (!v) return v;
+  v.approved_at = row.approved_at;
+  v.enforced = row.status === 'approved';
+  if (row.approved_at) {
+    const s = planSchedule(d, row);
+    v.schedule = s.installments;
+    v.next_installment = row.status === 'approved' ? s.next_installment : null;
+  }
+  return v;
 }
 
 async function handleTenantMessage(d, rpId, body, channel = 'sms') {
@@ -431,10 +551,11 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
             .run(event.id, new Date().toISOString(), pay.id);
         }
         const s = recompute(d, pay.rent_period_id);
+        settlePlan(d, pay.plan_id);
         const rp = getPeriod(d, pay.rent_period_id);
         logEvent(d, { kind: 'webhook_received', actor: 'paypal', rent_period_id: rp.id,
           summary: completed
-            ? `PayPal confirmed ${money(pay.amount_cents)} from ${rp.tenant_name} (capture ${res.id}). ${rp.unit_label} ${monthName(rp.period)}: ${s.status.replace('_', ' ')}, balance ${money(s.balance_cents)}`
+            ? `PayPal confirmed ${money(pay.amount_cents)} from ${rp.tenant_name}${pay.plan_id ? ` for plan #${pay.plan_id} installment ${pay.plan_installment}` : ''} (capture ${res.id}). ${rp.unit_label} ${monthName(rp.period)}: ${s.status.replace('_', ' ')}, balance ${money(s.balance_cents)}`
             : `PayPal DENIED capture ${res.id} (${money(pay.amount_cents)}) for ${rp.unit_label}. Balance ${money(s.balance_cents)}`,
           payload: { ...meta, payment_id: pay.id, status_before: s.before, status_after: s.status }, paypal_event_id: event.id });
         return { result: completed ? 'payment_confirmed' : 'payment_denied', payment_id: pay.id, ...s, ...base };
@@ -535,15 +656,25 @@ tr.planrow td{background:#fbfcff;padding:0 16px 16px}
 .ground{font-size:13px;background:#f3f6ff;border-radius:8px;padding:8px 10px;margin-bottom:10px}
 table.inst{border-radius:8px;margin-bottom:8px}table.inst td,table.inst th{padding:6px 12px}tr.tot td{font-weight:700;background:#fafbfc}
 .why{margin:6px 0 10px;font-size:13.5px}.issues{color:var(--warn);font-size:13px;margin:0 0 10px}
-button.inert{background:#e5e7eb;color:var(--muted);cursor:not-allowed}
 .who.ai{color:#7b1fa2}
+.plan-act{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}.plan-act form{margin:0}
+.plan.approved{border-color:#b7e1c3;border-left-color:var(--ok)}.pill.plan-approved{background:#e6f4ea;color:var(--ok)}
+.pill.inst-PAID{background:#e6f4ea;color:var(--ok)}.pill.inst-DUE{background:#e8efff;color:var(--brand)}.pill.inst-OVERDUE{background:#fdecea;color:var(--bad)}
+.pill.inst-UPCOMING{background:#f1f2f5;color:var(--muted)}.pill.inst-PROCESSING{background:#fff4e5;color:var(--warn)}
+form.pay.locked{align-items:center}.lockamt{font-weight:700;padding:6px 10px;border:1px dashed var(--ok);border-radius:8px;background:#f3fbf5}
+.who.landlord{color:var(--ok)}
 @media(max-width:820px){.kpis{grid-template-columns:1fr}table,thead,tbody,tr,td{display:block}thead{display:none}td{border:0;padding:8px 16px}tr{border-bottom:1px solid var(--line);padding:8px 0}.num{text-align:left}}
 `;
 
-// Latest open AI plan for a rent period, rendered under its unit row. "Approve" is deliberately inert (Sprint 3).
+// The plan shown under a unit row: the approved (enforced) plan if there is one, else the latest open AI proposal.
 function renderPlanRow(d, rp) {
-  const p = planView(d.prepare("SELECT * FROM plan WHERE rent_period_id=? AND status IN ('proposed','needs_review','parse_failed') ORDER BY id DESC LIMIT 1").get(rp.id));
+  const row = activePlanRow(d, rp.id)
+    || d.prepare("SELECT * FROM plan WHERE rent_period_id=? AND status IN ('proposed','needs_review','parse_failed','completed') ORDER BY id DESC LIMIT 1").get(rp.id);
+  const p = planOut(d, row);
   if (!p) return '';
+  if (p.status === 'completed' && rp.status === 'PAID' && p.schedule) return renderApprovedPlan(rp, p);
+  if (p.status === 'completed') return '';
+  if (p.status === 'approved') return renderApprovedPlan(rp, p);
   const msg = p.source_message_id ? d.prepare('SELECT body, received_at FROM message WHERE id=?').get(p.source_message_id) : null;
   const s = p.ledger_snapshot;
   const label = { proposed: 'AI proposal · awaiting your approval', needs_review: 'AI proposal · failed RentRoll checks, needs review', parse_failed: 'AI reply unusable' }[p.status];
@@ -551,7 +682,7 @@ function renderPlanRow(d, rp) {
     <td class="num">${Number.isFinite(x.amount_cents) ? money(x.amount_cents) : esc(x.amount_cents)}</td><td class="small">${esc(x.note)}</td></tr>`).join('');
   const sum = p.installments.reduce((a, x) => a + (Number.isFinite(x.amount_cents) ? x.amount_cents : 0), 0);
   return `<tr class="planrow"><td colspan="6"><div class="plan ${p.status}">
-    <div class="plan-h"><span class="pill plan-${p.status}">${esc(label)}</span><span class="small">${fmtTime(p.created_at)}</span></div>
+    <div class="plan-h"><span class="pill plan-${p.status}">${esc(label)}</span><span class="small">plan #${p.id} · ${fmtTime(p.created_at)}</span></div>
     ${msg ? `<blockquote>“${esc(msg.body)}”<span class="small"> · ${esc(rp.tenant_name)}, ${fmtTime(msg.received_at)}</span></blockquote>` : ''}
     ${s ? `<div class="ground"><b>Read from the ledger before proposing:</b> rent ${money(s.amount_due_cents)} due ${fmtDate(s.due_date)} − paid ${money(s.amount_paid_cents)}
       (${s.payments.length} PayPal capture${s.payments.length === 1 ? '' : 's'}) = <b>${money(s.outstanding_cents)} outstanding</b>.
@@ -560,7 +691,25 @@ function renderPlanRow(d, rp) {
       <tr class="tot"><td></td><td>Total</td><td class="num">${money(sum)}</td><td class="small">${s && Math.abs(sum - s.outstanding_cents) <= 1 ? '✓ matches the ledger balance' : '✗ does not match the ledger balance'}</td></tr></tbody></table>` : ''}
     ${p.reasoning ? `<p class="why"><b>AI reasoning:</b> ${esc(p.reasoning)}</p>` : ''}
     ${p.validation_errors.length ? `<ul class="issues">${p.validation_errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
-    ${p.status === 'proposed' ? `<button class="inert" disabled title="Not wired yet: approval and the PayPal invoice update land in Sprint 3">Approve · coming in Sprint 3</button>` : ''}
+    <div class="plan-act">
+      ${p.status === 'proposed' ? `<form method="post" action="/plans/${p.id}/approve" title="Locks the schedule: PayPal payments for this unit will only be accepted for the next installment's exact amount"><button>Approve plan</button></form>` : ''}
+      <form method="post" action="/plans/${p.id}/reject"><button class="ghost">${p.status === 'proposed' ? 'Reject' : 'Dismiss'}</button></form>
+      ${p.status === 'proposed' ? `<span class="small">Approving locks the tenant's payments to this schedule.</span>` : ''}
+    </div>
+  </div></td></tr>`;
+}
+
+const STATE_TXT = { PAID: '✓ PAID', PROCESSING: 'processing at PayPal', DUE: 'NEXT · due', OVERDUE: 'NEXT · overdue since', UPCOMING: 'upcoming' };
+function renderApprovedPlan(rp, p) {
+  const rows = p.schedule.map((x) => `<tr class="st-${x.state}"><td>${x.n} of ${x.of}</td><td>${fmtDate(x.due_date)}</td><td class="num">${money(x.amount_cents)}</td>
+    <td><span class="pill inst-${x.state}">${STATE_TXT[x.state]}${x.state === 'DUE' || x.state === 'OVERDUE' ? ' ' + fmtDate(x.due_date) : ''}</span>
+    ${x.paypal_capture_id ? `<span class="small"> capture ${esc(x.paypal_capture_id)}${x.webhook_confirmed ? ' · ✓ PayPal confirmed' : x.state === 'PAID' ? ' · awaiting webhook' : ''}</span>` : ''}</td></tr>`).join('');
+  return `<tr class="planrow"><td colspan="6"><div class="plan approved">
+    <div class="plan-h"><span class="pill plan-approved">${p.status === 'approved' ? '🔒 Approved plan · enforced on every PayPal payment' : '✓ Plan completed'}</span>
+      <span class="small">plan #${p.id} · approved ${fmtTime(p.approved_at)}</span></div>
+    <table class="inst"><thead><tr><th>Installment</th><th>Due</th><th class="num">Amount</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>
+    ${p.status === 'approved' ? `<div class="plan-act"><span class="small">Until this plan is done, "Tenant pays" only accepts the next installment's exact amount; anything else is refused before PayPal is called.</span>
+      <form method="post" action="/plans/${p.id}/reject"><button class="ghost">Cancel plan</button></form></div>` : ''}
   </div></td></tr>`;
 }
 
@@ -572,11 +721,15 @@ function renderDashboard(d, flash) {
   const events = d.prepare('SELECT * FROM event_log ORDER BY id DESC LIMIT 15').all();
   const trs = rows.map((rp) => {
     const pays = d.prepare('SELECT * FROM payment WHERE rent_period_id=? ORDER BY id').all(rp.id);
-    const na = nextAction(rp, pays);
+    const ap = activePlanRow(d, rp.id);
+    const nx = ap ? planSchedule(d, ap).next_installment : null;
+    const na = nx && !pays.some((p) => p.status === 'PENDING')
+      ? { tone: nx.state === 'OVERDUE' ? 'bad' : 'info', text: `On approved plan #${ap.id}: installment ${nx.n} of ${nx.of} (${money(nx.amount_cents)}) ${nx.state === 'OVERDUE' ? 'overdue since' : 'due'} ${fmtDate(nx.due_date)}` }
+      : nextAction(rp, pays);
     const bal = rp.amount_due_cents - rp.amount_paid_cents;
     const pct = Math.min(100, Math.round((rp.amount_paid_cents / rp.amount_due_cents) * 100));
     const payList = pays.filter((p) => p.status !== 'FAILED').map((p) =>
-      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card · ${p.status === 'COMPLETED' ? (p.webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}</li>`).join('');
+      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}</li>`).join('');
     return `<tr>
       <td><b>${esc(rp.unit_label)}</b><div class="small">${esc(rp.unit_address)}</div></td>
       <td>${esc(rp.tenant_name)}<div class="small">${esc(rp.tenant_email)}</div></td>
@@ -584,8 +737,11 @@ function renderDashboard(d, flash) {
       <td class="num">${money(rp.amount_paid_cents)}<div class="bar"><i style="width:${pct}%"></i></div>${bal > 0 && rp.amount_paid_cents > 0 ? `<div class="small">${money(bal)} left</div>` : ''}</td>
       <td><span class="pill ${rp.status}">${rp.status.replace('_', ' ')}</span></td>
       <td><div class="act ${na.tone}">${esc(na.text)}</div>${payList ? `<ul class="pays">${payList}</ul>` : ''}
-        ${bal > 0 ? `<form class="pay" method="post" action="/rent-periods/${rp.id}/pay-sandbox" title="Simulates the tenant paying by card (PayPal sandbox test card, no login)">
-          <input name="amount" inputmode="decimal" value="${(bal / 100).toFixed(2)}" aria-label="Amount in dollars"><button>Tenant pays</button></form>
+        ${bal > 0 ? `${nx ? `<form class="pay locked" method="post" action="/rent-periods/${rp.id}/pay-sandbox" title="Approved plan #${ap.id}: only this exact amount is accepted">
+          <input type="hidden" name="amount" value="${(nx.amount_cents / 100).toFixed(2)}"><span class="lockamt">🔒 ${money(nx.amount_cents)}</span>
+          <button>Tenant pays installment ${nx.n} of ${nx.of}</button></form><div class="small">Locked by approved plan #${ap.id} · due ${fmtDate(nx.due_date)}</div>`
+          : `<form class="pay" method="post" action="/rent-periods/${rp.id}/pay-sandbox" title="Simulates the tenant paying by card (PayPal sandbox test card, no login)">
+          <input name="amount" inputmode="decimal" value="${(bal / 100).toFixed(2)}" aria-label="Amount in dollars"><button>Tenant pays</button></form>`}
         <form class="pay msg" method="post" action="/rent-periods/${rp.id}/messages" title="Simulates an incoming tenant text; the AI drafts a plan from the live balance">
           <input name="body" placeholder="Tenant texts… e.g. can I pay 900 now and the rest later" aria-label="Tenant message"><button class="ghost">Tenant texted</button></form>` : ''}</td>
     </tr>${renderPlanRow(d, rp)}`;
@@ -686,7 +842,27 @@ function buildApp(d) {
     } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
   });
   app.get('/api/rent-periods/:id/plans', (req, res) =>
-    res.json(d.prepare('SELECT * FROM plan WHERE rent_period_id=? ORDER BY id DESC').all(Number(req.params.id)).map(planView)));
+    res.json(d.prepare('SELECT * FROM plan WHERE rent_period_id=? ORDER BY id DESC').all(Number(req.params.id)).map((r) => planOut(d, r))));
+
+  // Sprint 3: landlord approves / rejects a plan. Approval changes what pay-sandbox will accept.
+  const planId = (req) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'plan id must be a positive integer');
+    return id;
+  };
+  for (const [verb, fn, okMsg] of [
+    ['approve', approvePlan, (r) => `Plan #${r.plan.id} approved. The tenant can now only pay installment 1: ${money(r.plan.installments[0].amount_cents)}.`],
+    ['reject', rejectPlan, (r) => `Plan #${r.plan.id} rejected.`],
+  ]) {
+    app.post(`/api/plans/:id/${verb}`, (req, res) => {
+      try { res.json({ ok: true, ...fn(d, planId(req)) }); }
+      catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+    });
+    app.post(`/plans/:id/${verb}`, (req, res) => {
+      try { res.redirect(303, `/?ok=${encodeURIComponent(okMsg(fn(d, planId(req))))}`); }
+      catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
+    });
+  }
 
   // Body-parser and other uncaught errors: plain JSON, never Express's HTML page with a stack trace.
   app.use((err, _req, res, _next) => {
