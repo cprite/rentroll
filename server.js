@@ -3,7 +3,8 @@
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
 //                                  back-fills webhook deliveries from .sprint0-webhook-log.jsonl)
-//   node server.js --seed [--reset] seed demo data and exit (--reset wipes the demo DB first)
+//   node server.js --seed [--reset] seed demo data and exit (--reset wipes the demo DB and rotates the
+//                                  webhook log aside; stop rentroll.service first, start it again after)
 //   node server.js --ingest-webhook-log  replay logged deliveries through the handler and exit (idempotent)
 //
 // INVOICING (blocked: sandbox app has no Invoicing scope, 403 NOT_AUTHORIZED, see SPRINT0.md):
@@ -12,7 +13,7 @@
 //   setting rent_period.paypal_invoice_id / paypal_invoice_status / payer_view_url and adding an
 //   INVOICING.INVOICE.PAID case in handleWebhook() below (GET the invoice, read status + payments).
 import express from 'express';
-import { appendFileSync, readFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { appendFileSync, readFileSync, existsSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,10 +28,10 @@ const PORT = Number(process.env.PORT) || 8790;
 const HOST = '127.0.0.1';
 // Webhook id registered in Sprint 0 (not a secret). Override if the webhook is re-registered.
 const WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '8X653932CG029174U';
-// 'record' (default): verify every delivery with PayPal and store the result, but still process it.
-// 'enforce': reject (400) deliveries whose verification_status is not SUCCESS.
-// TODO(sprint2): switch default to 'enforce' once verification is confirmed SUCCESS on live deliveries.
-const WEBHOOK_VERIFY = process.env.WEBHOOK_VERIFY || 'record';
+// 'enforce' (default): reject (400) deliveries whose PayPal verification_status is not SUCCESS, so an
+//   unsigned/forged POST can never create a payment or change a rent period (TESTER1 F1).
+// 'record': debugging only. Verify and store the result, but still process unverified deliveries.
+const WEBHOOK_VERIFY = process.env.WEBHOOK_VERIFY === 'record' ? 'record' : 'enforce';
 const today = () => process.env.RENTROLL_TODAY || new Date().toISOString().slice(0, 10);
 
 // ───────────────────────────── data model ─────────────────────────────
@@ -125,6 +126,15 @@ CREATE TRIGGER IF NOT EXISTS event_log_no_update BEFORE UPDATE ON event_log
   BEGIN SELECT RAISE(ABORT, 'event_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS event_log_no_delete BEFORE DELETE ON event_log
   BEGIN SELECT RAISE(ABORT, 'event_log is append-only'); END;
+-- INSERT OR REPLACE deletes the conflicting row without firing the DELETE trigger when recursive_triggers
+-- is off (the default for any other connection, e.g. the sqlite3 CLI). Block it at schema level (TESTER1 F3).
+-- Note: anyone with write access to the file can still DROP these triggers; this is append-only, not tamper-proof.
+CREATE TRIGGER IF NOT EXISTS event_log_no_replace BEFORE INSERT ON event_log
+  WHEN EXISTS (SELECT 1 FROM event_log WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'event_log is append-only: id already exists'); END;
+CREATE TRIGGER IF NOT EXISTS event_log_no_replace_event BEFORE INSERT ON event_log
+  WHEN NEW.paypal_event_id IS NOT NULL AND EXISTS (SELECT 1 FROM event_log WHERE paypal_event_id = NEW.paypal_event_id)
+  BEGIN SELECT RAISE(ABORT, 'event_log is append-only: duplicate paypal_event_id'); END;
 CREATE INDEX IF NOT EXISTS payment_period ON payment(rent_period_id);
 CREATE INDEX IF NOT EXISTS event_period ON event_log(rent_period_id);
 `;
@@ -132,7 +142,7 @@ CREATE INDEX IF NOT EXISTS event_period ON event_log(rent_period_id);
 function openDb(file = DB_PATH) {
   mkdirSync(path.dirname(file), { recursive: true });
   const d = new DatabaseSync(file);
-  d.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  d.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA recursive_triggers = ON;');
   d.exec(SCHEMA);
   return d;
 }
@@ -210,8 +220,10 @@ const captureFields = (cap) => {
 
 // "Tenant pays $X now": create-and-capture a PayPal Order with the documented sandbox test card
 // (developer.paypal.com/tools/sandbox/card-testing), no buyer login. Exactly the Sprint 0 flow.
+const SANDBOX_HOSTS = new Set(['api-m.sandbox.paypal.com', 'api.sandbox.paypal.com']);
+const isSandboxBase = (base) => { try { return SANDBOX_HOSTS.has(new URL(base).hostname.toLowerCase()); } catch { return false; } };
 async function payRentPeriodSandbox(d, rpId, amountCents) {
-  if (!/sandbox/i.test(process.env.PAYPAL_API_BASE || '')) throw new HttpError(503, 'sandbox card payments are disabled: PAYPAL_API_BASE is not a sandbox URL');
+  if (!isSandboxBase(process.env.PAYPAL_API_BASE || '')) throw new HttpError(503, 'sandbox card payments are disabled: PAYPAL_API_BASE is not a sandbox URL');
   if (!Number.isInteger(amountCents) || amountCents <= 0) throw new HttpError(400, 'amount must be a positive dollar amount, e.g. "800.00"');
 
   // 1. Reserve the attempt locally first (PENDING) so a webhook racing the API response can still match it.
@@ -304,7 +316,7 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
   try {
     return tx(d, () => {
       if (seen()) return { result: 'duplicate', event_id: event.id };
-      const meta = { ...base, resource_id: res.id, custom_id: res.custom_id, amount: res.amount, create_time: event.create_time };
+      const meta = { ...base, resource_id: res.id, custom_id: res.custom_id, amount: res.amount, create_time: event.create_time ?? null };
 
       if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED' || event.event_type === 'PAYMENT.CAPTURE.DENIED') {
         const completed = event.event_type === 'PAYMENT.CAPTURE.COMPLETED';
@@ -317,7 +329,7 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
           const { fee, net } = captureFields(res);
           const id = Number(d.prepare(`INSERT INTO payment (rent_period_id, installment_index, source, status, amount_cents, fee_cents, net_cents,
               custom_id, paypal_capture_id, paid_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-            .run(Number(m[1]), Number(m[4]), 'paypal_capture', 'COMPLETED', amt, fee, net, res.custom_id, res.id, res.create_time || event.create_time).lastInsertRowid);
+            .run(Number(m[1]), Number(m[4]), 'paypal_capture', 'COMPLETED', amt, fee, net, res.custom_id, res.id, res.create_time || event.create_time || new Date().toISOString()).lastInsertRowid);
           pay = d.prepare('SELECT * FROM payment WHERE id=?').get(id);
         }
         if (!pay) {
@@ -329,7 +341,7 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
         if (completed) {
           d.prepare(`UPDATE payment SET status='COMPLETED', paypal_capture_id=COALESCE(paypal_capture_id, ?), fee_cents=COALESCE(fee_cents, ?),
               net_cents=COALESCE(net_cents, ?), paid_at=COALESCE(paid_at, ?), webhook_event_id=?, webhook_confirmed_at=? WHERE id=?`)
-            .run(res.id, fee, net, res.create_time || event.create_time, event.id, new Date().toISOString(), pay.id);
+            .run(res.id, fee, net, res.create_time || event.create_time || new Date().toISOString(), event.id, new Date().toISOString(), pay.id);
         } else {
           d.prepare("UPDATE payment SET status='DENIED', webhook_event_id=?, webhook_confirmed_at=?, error='PAYMENT.CAPTURE.DENIED' WHERE id=?")
             .run(event.id, new Date().toISOString(), pay.id);
@@ -350,7 +362,7 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
       return { result: 'logged', ...base };
     });
   } catch (e) {
-    if (/UNIQUE constraint failed: event_log\.paypal_event_id/.test(e.message)) return { result: 'duplicate', event_id: event.id };
+    if (/UNIQUE constraint failed: event_log\.paypal_event_id|duplicate paypal_event_id/.test(e.message)) return { result: 'duplicate', event_id: event.id };
     throw e;
   }
 }
@@ -503,6 +515,9 @@ function buildApp(d) {
     res.type('html').send(renderDashboard(d, flash));
   });
 
+  // TODO(before real tenants): /api/rent-periods, /api/event-log and the dashboard are public through the
+  // Tailscale Funnel and expose tenant name/email/phone. Fine for fake hackathon seed data only; add auth
+  // before any real tenant data goes in.
   app.get('/api/rent-periods', (_req, res) => res.json(currentPeriods(d).map((rp) => ({
     ...rp, balance_cents: rp.amount_due_cents - rp.amount_paid_cents,
     payments: d.prepare('SELECT * FROM payment WHERE rent_period_id=? ORDER BY id').all(rp.id),
@@ -527,13 +542,29 @@ function buildApp(d) {
       res.redirect(303, `/?ok=${encodeURIComponent(`Payment of ${money(r.payment.amount_cents)} captured through PayPal (capture ${r.payment.paypal_capture_id}). PayPal's webhook will confirm it shortly.`)}`);
     } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
   });
+  // Body-parser and other uncaught errors: plain JSON, never Express's HTML page with a stack trace.
+  app.use((err, _req, res, _next) => {
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+    if (status >= 500) console.error('[http] unhandled error:', err.message);
+    res.status(status).json({ ok: false, error: err.type === 'entity.parse.failed' ? 'invalid JSON body' : status < 500 ? err.message : 'internal error' });
+  });
   return app;
 }
 
 // ───────────────────────────── entry point ─────────────────────────────
 const args = process.argv.slice(2);
 if (args.includes('--seed')) {
-  if (args.includes('--reset')) for (const s of ['', '-wal', '-shm']) rmSync(DB_PATH + s, { force: true });
+  if (args.includes('--reset')) {
+    // Stop rentroll.service first: a running server keeps serving the unlinked DB file until it restarts.
+    for (const s of ['', '-wal', '-shm']) rmSync(DB_PATH + s, { force: true });
+    // The startup back-fill replays WEBHOOK_LOG, which would re-create the old payments in the fresh DB
+    // (TESTER1 F2). Rotate the log aside (kept for audit, not deleted) so reset stays reset.
+    if (existsSync(WEBHOOK_LOG)) {
+      const rotated = `${WEBHOOK_LOG}.pre-reset-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      renameSync(WEBHOOK_LOG, rotated);
+      console.log(`rotated webhook log to ${rotated}`);
+    }
+  }
   const d = openDb();
   const n = seed(d);
   console.log(n ? `seeded ${n} units into ${DB_PATH}` : `already seeded (${DB_PATH}); add --reset to start over`);
