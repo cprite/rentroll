@@ -1,4 +1,5 @@
-// RentRoll server (Sprint 1: data model, dashboard, sandbox capture, webhook ledger).
+// RentRoll server (Sprint 1: data model, dashboard, sandbox capture, webhook ledger;
+// Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js).
 //
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
@@ -19,6 +20,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { pp } from './lib/paypal.js';
+import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Raw delivery log, kept for audit (override in tests so fake events never land in the real log).
@@ -36,6 +38,22 @@ const today = () => process.env.RENTROLL_TODAY || new Date().toISOString().slice
 
 // ───────────────────────────── data model ─────────────────────────────
 // All money is integer cents; timestamps ISO-8601 UTC.
+// Sprint 2 fills `plan` from the AI flow (statuses parse_failed / needs_review added; migrated in openDb).
+const PLAN_TABLE = `CREATE TABLE IF NOT EXISTS plan (
+  id                    INTEGER PRIMARY KEY,
+  rent_period_id        INTEGER NOT NULL REFERENCES rent_period(id),
+  status                TEXT NOT NULL DEFAULT 'proposed'
+                        CHECK (status IN ('proposed','needs_review','parse_failed','approved','rejected','broken','completed')),
+  source_message_id     INTEGER REFERENCES message(id),
+  installments_json     TEXT NOT NULL DEFAULT '[]',  -- [{due_date, amount_cents, note, payment_id?}]
+  ai_rationale          TEXT,                        -- the model's "reasoning" field, shown to the landlord
+  validation_json       TEXT,                        -- server-side validation errors (empty array = passed)
+  ledger_snapshot_json  TEXT,                        -- the exact ledger numbers our code fed the model
+  llm_meta_json         TEXT,                        -- model, attempts, finish_reason, usage, timing
+  raw_response          TEXT,                        -- raw model output (always kept, esp. for parse_failed)
+  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  approved_at           TEXT
+);`;
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tenant (
   id         INTEGER PRIMARY KEY,
@@ -79,16 +97,7 @@ CREATE TABLE IF NOT EXISTS message (
   received_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   ai_extraction_json TEXT
 );
-CREATE TABLE IF NOT EXISTS plan (           -- schema only in Sprint 1; Sprint 2 (AI proposal + approval) fills it
-  id                INTEGER PRIMARY KEY,
-  rent_period_id    INTEGER NOT NULL REFERENCES rent_period(id),
-  status            TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','approved','rejected','broken','completed')),
-  source_message_id INTEGER REFERENCES message(id),
-  installments_json TEXT NOT NULL DEFAULT '[]',  -- [{due_date, amount_cents, payment_id?}]
-  ai_rationale      TEXT,
-  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  approved_at       TEXT
-);
+${PLAN_TABLE}
 CREATE TABLE IF NOT EXISTS payment (
   id                   INTEGER PRIMARY KEY,
   rent_period_id       INTEGER NOT NULL REFERENCES rent_period(id),
@@ -144,7 +153,24 @@ function openDb(file = DB_PATH) {
   const d = new DatabaseSync(file);
   d.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA recursive_triggers = ON;');
   d.exec(SCHEMA);
+  migrate(d);
   return d;
+}
+// Sprint 1 DBs have the old plan CHECK constraint and no message.rent_period_id; upgrade in place.
+function migrate(d) {
+  const planSql = d.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='plan'").get()?.sql || '';
+  if (!planSql.includes('parse_failed')) {
+    tx(d, () => {
+      d.exec('ALTER TABLE plan RENAME TO plan_sprint1');
+      d.exec(PLAN_TABLE);
+      d.exec(`INSERT INTO plan (id, rent_period_id, status, source_message_id, installments_json, ai_rationale, created_at, approved_at)
+        SELECT id, rent_period_id, status, source_message_id, installments_json, ai_rationale, created_at, approved_at FROM plan_sprint1`);
+      d.exec('DROP TABLE plan_sprint1');
+    });
+  }
+  const msgCols = d.prepare('PRAGMA table_info(message)').all().map((c) => c.name);
+  if (!msgCols.includes('rent_period_id')) d.exec('ALTER TABLE message ADD COLUMN rent_period_id INTEGER REFERENCES rent_period(id)');
+  d.exec('CREATE INDEX IF NOT EXISTS plan_period ON plan(rent_period_id)');
 }
 // node:sqlite has no transaction helper; BEGIN IMMEDIATE serialises writers (also across processes).
 function tx(d, fn) {
@@ -286,6 +312,64 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
       payload: { payment_id: payId, order_id: order.id, capture_id: cap.id, capture_status: cap.status, fee_cents: fee, net_cents: net, custom_id: customId } });
     return { payment: d.prepare('SELECT * FROM payment WHERE id=?').get(payId), rent_period: s };
   });
+}
+
+// ───────────────────────────── tenant message → AI plan (Sprint 2) ─────────────────────────────
+function planView(row) {
+  if (!row) return null;
+  const j = (s, dflt) => { try { return s ? JSON.parse(s) : dflt; } catch { return dflt; } };
+  return { id: row.id, rent_period_id: row.rent_period_id, status: row.status, source_message_id: row.source_message_id,
+    installments: j(row.installments_json, []), reasoning: row.ai_rationale, validation_errors: j(row.validation_json, []),
+    ledger_snapshot: j(row.ledger_snapshot_json, null), llm: j(row.llm_meta_json, null), raw_response: row.raw_response,
+    created_at: row.created_at };
+}
+
+async function handleTenantMessage(d, rpId, body, channel = 'sms') {
+  if (typeof body !== 'string' || !body.trim()) throw new HttpError(400, 'body must be the tenant\'s message text');
+  if (body.length > 2000) throw new HttpError(413, 'message too long (max 2000 characters)');
+  if (!['sms', 'email', 'app'].includes(channel)) channel = 'sms';
+  const rp = getPeriod(d, rpId);
+  if (!rp) throw new HttpError(404, `rent period ${rpId} not found`);
+
+  const messageId = tx(d, () => {
+    const id = Number(d.prepare('INSERT INTO message (tenant_id, rent_period_id, direction, channel, body) VALUES (?,?,?,?,?)')
+      .run(rp.tenant_id, rp.id, 'in', channel, body.trim()).lastInsertRowid);
+    logEvent(d, { kind: 'message_in', actor: 'tenant', rent_period_id: rp.id, summary: `${rp.tenant_name} (${channel}): "${body.trim().slice(0, 160)}"`,
+      payload: { message_id: id } });
+    return id;
+  });
+
+  // THE grounding step: real balance computed by our code from the ledger, not by the model.
+  const snap = ledgerSnapshot(d, rp.id, today());
+  if (snap.outstanding_cents <= 0) {
+    return { http: 409, message_id: messageId, plan: null, ledger_snapshot: snap,
+      error: `${rp.unit_label} ${rp.period} is already paid in full (${money(snap.amount_paid_cents)} of ${money(snap.amount_due_cents)}); no plan needed` };
+  }
+
+  let r;
+  try { r = await proposePlan(snap, body.trim()); }
+  catch (e) {
+    r = { status: 'parse_failed', installments: [], reasoning: null, errors: [`LLM call failed: ${e.message}`], raw: null, meta: { error: e.message } };
+  }
+  const planId = tx(d, () => {
+    const id = Number(d.prepare(`INSERT INTO plan (rent_period_id, status, source_message_id, installments_json, ai_rationale, validation_json,
+        ledger_snapshot_json, llm_meta_json, raw_response) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(rp.id, r.status, messageId, JSON.stringify(r.installments), r.reasoning, JSON.stringify(r.errors || []),
+        JSON.stringify(snap), JSON.stringify(r.meta || null), r.raw).lastInsertRowid);
+    d.prepare('UPDATE message SET ai_extraction_json=? WHERE id=?')
+      .run(JSON.stringify({ plan_id: id, tenant_stated: r.tenant_stated ?? null, adjusted: r.adjusted ?? null }), messageId);
+    const sched = r.installments.map((x) => `${money(x.amount_cents)} on ${x.due_date}`).join(', ');
+    logEvent(d, { kind: 'plan_proposed', actor: 'ai', rent_period_id: rp.id,
+      summary: r.status === 'proposed'
+        ? `AI proposed a plan for the ${money(snap.outstanding_cents)} balance: ${sched}. Awaiting landlord approval`
+        : r.status === 'needs_review'
+          ? `AI plan needs review (${r.errors[0]}). Proposed: ${sched || 'nothing'}`
+          : `AI could not produce a usable plan (${(r.errors || [])[0] || 'parse failed'}). Raw reply kept for review`,
+      payload: { plan_id: id, message_id: messageId, status: r.status, outstanding_cents: snap.outstanding_cents } });
+    return id;
+  });
+  return { http: 200, message_id: messageId, plan: planView(d.prepare('SELECT * FROM plan WHERE id=?').get(planId)),
+    tenant_stated: r.tenant_stated ?? null, adjusted: r.adjusted ?? null };
 }
 
 // ───────────────────────────── webhooks ─────────────────────────────
@@ -441,8 +525,44 @@ h2{font-size:17px;margin:30px 0 10px}
 .feed time{width:130px;flex:none;color:var(--muted);font-size:12.5px;padding-top:1px}
 .who{flex:none;width:64px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);padding-top:2px}.who.paypal{color:var(--brand)}
 footer{color:var(--muted);font-size:12.5px;padding:28px 0 40px}
+form.msg input{width:250px}button.ghost{background:#fff;color:var(--brand);border:1px solid #c9d8ff}
+tr.planrow td{background:#fbfcff;padding:0 16px 16px}
+.plan{border:1px solid #c9d8ff;border-left:4px solid var(--brand);border-radius:10px;background:#fff;padding:12px 16px}
+.plan.needs_review,.plan.parse_failed{border-color:#ffd59e;border-left-color:var(--warn)}
+.plan-h{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:8px}
+.pill.plan-proposed{background:#e8efff;color:var(--brand)}.pill.plan-needs_review,.pill.plan-parse_failed{background:#fff4e5;color:var(--warn)}
+.plan blockquote{margin:0 0 8px;padding:6px 12px;border-left:3px solid var(--line);font-style:italic}
+.ground{font-size:13px;background:#f3f6ff;border-radius:8px;padding:8px 10px;margin-bottom:10px}
+table.inst{border-radius:8px;margin-bottom:8px}table.inst td,table.inst th{padding:6px 12px}tr.tot td{font-weight:700;background:#fafbfc}
+.why{margin:6px 0 10px;font-size:13.5px}.issues{color:var(--warn);font-size:13px;margin:0 0 10px}
+button.inert{background:#e5e7eb;color:var(--muted);cursor:not-allowed}
+.who.ai{color:#7b1fa2}
 @media(max-width:820px){.kpis{grid-template-columns:1fr}table,thead,tbody,tr,td{display:block}thead{display:none}td{border:0;padding:8px 16px}tr{border-bottom:1px solid var(--line);padding:8px 0}.num{text-align:left}}
 `;
+
+// Latest open AI plan for a rent period, rendered under its unit row. "Approve" is deliberately inert (Sprint 3).
+function renderPlanRow(d, rp) {
+  const p = planView(d.prepare("SELECT * FROM plan WHERE rent_period_id=? AND status IN ('proposed','needs_review','parse_failed') ORDER BY id DESC LIMIT 1").get(rp.id));
+  if (!p) return '';
+  const msg = p.source_message_id ? d.prepare('SELECT body, received_at FROM message WHERE id=?').get(p.source_message_id) : null;
+  const s = p.ledger_snapshot;
+  const label = { proposed: 'AI proposal · awaiting your approval', needs_review: 'AI proposal · failed RentRoll checks, needs review', parse_failed: 'AI reply unusable' }[p.status];
+  const inst = p.installments.map((x, i) => `<tr><td>${i + 1}</td><td>${x.due_date && /^\d{4}-\d{2}-\d{2}$/.test(x.due_date) ? fmtDate(x.due_date) : esc(x.due_date)}</td>
+    <td class="num">${Number.isFinite(x.amount_cents) ? money(x.amount_cents) : esc(x.amount_cents)}</td><td class="small">${esc(x.note)}</td></tr>`).join('');
+  const sum = p.installments.reduce((a, x) => a + (Number.isFinite(x.amount_cents) ? x.amount_cents : 0), 0);
+  return `<tr class="planrow"><td colspan="6"><div class="plan ${p.status}">
+    <div class="plan-h"><span class="pill plan-${p.status}">${esc(label)}</span><span class="small">${fmtTime(p.created_at)}</span></div>
+    ${msg ? `<blockquote>“${esc(msg.body)}”<span class="small"> · ${esc(rp.tenant_name)}, ${fmtTime(msg.received_at)}</span></blockquote>` : ''}
+    ${s ? `<div class="ground"><b>Read from the ledger before proposing:</b> rent ${money(s.amount_due_cents)} due ${fmtDate(s.due_date)} − paid ${money(s.amount_paid_cents)}
+      (${s.payments.length} PayPal capture${s.payments.length === 1 ? '' : 's'}) = <b>${money(s.outstanding_cents)} outstanding</b>.
+      Late fee ${s.late_fee_rule.value_cents ? money(s.late_fee_rule.value_cents) : 'none'} ${s.late_fee_currently_applicable ? `applicable since ${fmtDate(s.late_fee_applies_from)} (not charged)` : 'not yet applicable'}.</div>` : ''}
+    ${inst ? `<table class="inst"><thead><tr><th>#</th><th>Due</th><th class="num">Amount</th><th>Note</th></tr></thead><tbody>${inst}
+      <tr class="tot"><td></td><td>Total</td><td class="num">${money(sum)}</td><td class="small">${s && Math.abs(sum - s.outstanding_cents) <= 1 ? '✓ matches the ledger balance' : '✗ does not match the ledger balance'}</td></tr></tbody></table>` : ''}
+    ${p.reasoning ? `<p class="why"><b>AI reasoning:</b> ${esc(p.reasoning)}</p>` : ''}
+    ${p.validation_errors.length ? `<ul class="issues">${p.validation_errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}
+    ${p.status === 'proposed' ? `<button class="inert" disabled title="Not wired yet: approval and the PayPal invoice update land in Sprint 3">Approve · coming in Sprint 3</button>` : ''}
+  </div></td></tr>`;
+}
 
 function renderDashboard(d, flash) {
   const rows = currentPeriods(d);
@@ -465,8 +585,10 @@ function renderDashboard(d, flash) {
       <td><span class="pill ${rp.status}">${rp.status.replace('_', ' ')}</span></td>
       <td><div class="act ${na.tone}">${esc(na.text)}</div>${payList ? `<ul class="pays">${payList}</ul>` : ''}
         ${bal > 0 ? `<form class="pay" method="post" action="/rent-periods/${rp.id}/pay-sandbox" title="Simulates the tenant paying by card (PayPal sandbox test card, no login)">
-          <input name="amount" inputmode="decimal" value="${(bal / 100).toFixed(2)}" aria-label="Amount in dollars"><button>Tenant pays</button></form>` : ''}</td>
-    </tr>`;
+          <input name="amount" inputmode="decimal" value="${(bal / 100).toFixed(2)}" aria-label="Amount in dollars"><button>Tenant pays</button></form>
+        <form class="pay msg" method="post" action="/rent-periods/${rp.id}/messages" title="Simulates an incoming tenant text; the AI drafts a plan from the live balance">
+          <input name="body" placeholder="Tenant texts… e.g. can I pay 900 now and the rest later" aria-label="Tenant message"><button class="ghost">Tenant texted</button></form>` : ''}</td>
+    </tr>${renderPlanRow(d, rp)}`;
   }).join('');
   const feed = events.map((e) => `<li><time>${fmtTime(e.at)}</time><span class="who ${e.actor}">${esc(e.actor)}</span><span>${esc(e.summary)}</span></li>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -542,6 +664,30 @@ function buildApp(d) {
       res.redirect(303, `/?ok=${encodeURIComponent(`Payment of ${money(r.payment.amount_cents)} captured through PayPal (capture ${r.payment.paypal_capture_id}). PayPal's webhook will confirm it shortly.`)}`);
     } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
   });
+  // Sprint 2: tenant message in -> AI plan grounded in the ledger. JSON {"body": "...", "channel": "sms"}
+  app.post('/api/rent-periods/:id/messages', express.json(), async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'rent period id must be a positive integer');
+      const r = await handleTenantMessage(d, id, req.body?.body, req.body?.channel);
+      const { http, ...out } = r;
+      res.status(http).json({ ok: http === 200, ...out });
+    } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+  });
+  // Dashboard form version ("Tenant texted").
+  app.post('/rent-periods/:id/messages', express.urlencoded({ extended: false }), async (req, res) => {
+    try {
+      const r = await handleTenantMessage(d, Number(req.params.id), req.body?.body, 'sms');
+      if (!r.plan) return res.redirect(303, `/?err=${encodeURIComponent(r.error)}`);
+      const msg = { proposed: 'AI proposed a payment plan. Review it under the unit below.',
+        needs_review: 'AI proposed a plan, but it failed RentRoll\'s checks. Review it below before doing anything.',
+        parse_failed: 'The AI reply could not be used. The raw reply is saved; nothing was proposed.' }[r.plan.status];
+      res.redirect(303, `/?${r.plan.status === 'proposed' ? 'ok' : 'err'}=${encodeURIComponent(msg)}`);
+    } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
+  });
+  app.get('/api/rent-periods/:id/plans', (req, res) =>
+    res.json(d.prepare('SELECT * FROM plan WHERE rent_period_id=? ORDER BY id DESC').all(Number(req.params.id)).map(planView)));
+
   // Body-parser and other uncaught errors: plain JSON, never Express's HTML page with a stack trace.
   app.use((err, _req, res, _next) => {
     const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
