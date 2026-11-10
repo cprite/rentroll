@@ -5,7 +5,10 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "seed": "node server.js --seed",
+    "reset": "node server.js --seed --reset",
+    "ingest-webhooks": "NODE_USE_ENV_PROXY=1 node server.js --ingest-webhook-log"
   },
   "dependencies": {
     "express": "^4.22.3"

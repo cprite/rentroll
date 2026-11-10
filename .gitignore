@@ -3,3 +3,4 @@ node_modules/
 .sprint0-webhook-log.jsonl
 *.log
 scratch/
+data/
