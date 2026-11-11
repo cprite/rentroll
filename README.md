@@ -10,9 +10,7 @@ Every month's rent is a real PayPal invoice. When a tenant writes "can I pay 900
 
 Live demo: https://nikopi5.tail4aaac7.ts.net/
 
-It's behind a shared login so random visitors can't press the buttons before a judge does — ask Nikolay or
-hack-lead for the current one (rotated regularly, not committed here on purpose). It runs against PayPal's
-sandbox, so no real money moves.
+It's behind a shared login so random visitors can't press the buttons before a judge does. Judges: the login is in the testing instructions of the Devpost submission. It runs against PayPal's sandbox, so no real money moves.
 
 ## What it does
 
