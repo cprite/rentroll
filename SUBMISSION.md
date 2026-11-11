@@ -10,7 +10,7 @@ Small landlords get partial-payment plans based on what the tenant has actually 
 
 ## Inspiration
 
-Before picking this idea we read 2,617 Reddit posts about payment pain, across 28 subreddits. About 30 of them were small landlords chasing rent by hand. One landlord on r/Landlord (November 2026) put it simply: "Top of each month is my wife and I asking each other if the tenant paid rent." We checked that against 546 hackathon demo videos and 252 GitHub repos built for this event, and found no entry that targets rent collection for small landlords specifically — the closest matches were general invoicing/collections tools and unrelated rental-deposit holds. That gap, and the fact that a partial-payment plan agreed over text has no enforcement and no paper trail, is what RentRoll is for.
+Before picking this idea we read 2,617 Reddit posts about payment pain, across 28 subreddits. About 30 of them were small landlords chasing rent by hand. One landlord on r/Landlord (November 2026) put it simply: "Top of each month is my wife and I asking each other if the tenant paid rent." A partial-payment plan agreed over text has no enforcement and no paper trail, and that's what RentRoll is for.
 
 ## Description
 
