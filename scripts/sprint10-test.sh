@@ -79,9 +79,9 @@ print("  invoice terms:",json.dumps((r.get("invoice") or {}).get("invoice_terms"
 echo '$ GET /api/rent-periods/1001/invoice'; inv
 
 CAP2=$(python3 -c 'import json;print(json.load(open("'"$T"'/pay2.json"))["payment"]["paypal_capture_id"])')
-echo "  waiting up to 150 s for capture $CAP2 + the invoice's final INVOICING.INVOICE.PAID (status PAID) in the live log..."
+echo "  waiting up to 150 s for capture $CAP2 + the invoice's final INVOICING.INVOICE.PAID (status PAID or MARKED_AS_PAID) in the live log..."
 for i in $(seq 1 75); do
-  grep -q "\"$CAP2\"" $LIVE_LOG && grep "INVOICING.INVOICE.PAID" $LIVE_LOG | grep "\"$INVID\"" | grep -q '"status":"PAID"' && break; sleep 2; done
+  grep -q "\"$CAP2\"" $LIVE_LOG && grep "INVOICING.INVOICE.PAID" $LIVE_LOG | grep "\"$INVID\"" | grep -Eq '"status":"(MARKED_AS_)?PAID"' && break; sleep 2; done
 : > "$RENTROLL_WEBHOOK_LOG.new"
 grep "\"$CAP2\"" $LIVE_LOG | grep PAYMENT.CAPTURE.COMPLETED | head -1 >> "$RENTROLL_WEBHOOK_LOG.new"
 grep "\"$INVID\"" $LIVE_LOG | grep 'INVOICING.INVOICE' >> "$RENTROLL_WEBHOOK_LOG.new"

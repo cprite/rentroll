@@ -597,7 +597,7 @@ async function syncInvoiceTerms(d, rpId, { reason }) {
   const applied = f.allow_partial_payment === terms.allowPartial && (!terms.allowPartial || f.minimum_amount_due_cents === terms.minimumCents) && f.due_date === terms.dueDate;
   tx(d, () => {
     saveInvoiceMirror(d, rpId, f);
-    logEvent(d, { kind: 'invoice_updated', actor: 'landlord', rent_period_id: rpId,
+    logEvent(d, { kind: 'invoice_updated', actor: /approved|cancelled/.test(reason) ? 'landlord' : 'system', rent_period_id: rpId,
       summary: `PayPal invoice ${f.number} updated (${reason}): ${minTxt(fb)} -> ${minTxt(f)}, due ${fb.due_date} -> ${f.due_date}. Read back from PayPal: status ${f.status}${applied ? '' : ' (WARNING: PayPal did not store what RentRoll sent)'}`,
       payload: { invoice_id: f.id, invoice_number: f.number, reason, plan_id: ap?.id ?? null, before: invTerms(fb), after: invTerms(f), applied, put_debug_id: r.put_debug_id } });
   });
@@ -1051,7 +1051,7 @@ function renderDashboard(d, flash) {
     const bal = rp.amount_due_cents - rp.amount_paid_cents;
     const pct = Math.min(100, Math.round((rp.amount_paid_cents / rp.amount_due_cents) * 100));
     const payList = pays.filter((p) => p.status !== 'FAILED').map((p) =>
-      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id || p.invoice_webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}${p.invoice_payment_id ? ` · on invoice (${esc(p.invoice_payment_id)})` : ''}</li>`).join('');
+      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} ${p.source === 'paypal_invoice' ? 'paid on PayPal invoice' : 'card'}${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id || p.invoice_webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}${p.invoice_payment_id ? ` · on invoice (${esc(p.invoice_payment_id)})` : ''}</li>`).join('');
     return `<tr>
       <td><b>${esc(rp.unit_label)}</b><div class="small">${esc(rp.unit_address)}</div>
         <a class="packet small" href="/api/rent-periods/${rp.id}/court-packet.pdf" title="Payment-history PDF from the ledger and PayPal records (not legal advice)">Download court packet (PDF)</a>
