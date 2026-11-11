@@ -57,7 +57,9 @@ Then:
 npm install && ./start.sh
 ```
 
-On first start it creates `data/rentroll.db` with three demo tenants and creates and sends one PayPal sandbox invoice per rent period. Your sandbox app needs the Invoicing feature enabled. `RENTROLL_INVOICING=0` turns every Invoicing call off. `node server.js --open-month 2026-12` opens the next month's rent periods and their invoices. `npm run reset` wipes it and starts over.
+On first start it creates `data/rentroll.db` with three demo tenants and creates and sends one PayPal sandbox invoice per rent period. Your sandbox app needs the Invoicing feature enabled. `RENTROLL_INVOICING=0` turns every Invoicing call off. `node server.js --open-month 2026-12` opens the next month's rent periods and their invoices. `npm run reset` wipes it and starts over (new invoices too, with new invoice numbers).
+
+**Resetting a running hosted demo** (e.g. before judges look at it): stop the process first — a running server keeps serving the old DB file in memory until it restarts — run `npm run reset`, then start the process again. For the systemd-managed demo that's `systemctl --user stop rentroll && npm run reset && systemctl --user start rentroll`.
 
 For webhooks, register one at `$PUBLIC_BASE_URL/webhooks/paypal` (`node scripts/sprint0-webhook.mjs` does it) and put its id in `PAYPAL_WEBHOOK_ID`. Webhooks with a bad signature are rejected. Payments still work without them, they just won't get the "PayPal confirmed" badge.
 
