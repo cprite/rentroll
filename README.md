@@ -6,7 +6,7 @@ When a tenant writes "can I pay 900 now and the rest on the 15th", RentRoll chec
 
 Live demo: https://nikopi5.tail4aaac7.ts.net/
 
-No login. It runs against PayPal's sandbox, so no real money moves.
+Login: user `judge`, password `8c8r45j5md`. It's a shared demo login, published here on purpose, so random visitors can't press the buttons before you do. It runs against PayPal's sandbox, so no real money moves.
 
 ## What it does
 
@@ -44,6 +44,8 @@ LLM_BASE_URL
 LLM_MODEL              # we use nvidia/nemotron-3.5-lightning-30b-a3b
 PUBLIC_BASE_URL        # public https URL PayPal can reach for webhooks
 PORT                   # defaults to 8790
+DEMO_USER              # HTTP Basic Auth login for every page except /healthz and /webhooks/paypal
+DEMO_PASSWORD          # set both on any public deployment; if unset, the login is demo/demo (local dev only)
 ```
 
 Then:

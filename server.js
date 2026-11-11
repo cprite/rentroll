@@ -26,6 +26,7 @@ import { pp } from './lib/paypal.js';
 import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
 import { courtPacketData, renderCourtPacketPdf } from './lib/court-packet.js';
+import { basicAuth } from './lib/auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Raw delivery log, kept for audit (override in tests so fake events never land in the real log).
@@ -858,6 +859,8 @@ function renderDashboard(d, flash) {
 // ───────────────────────────── HTTP ─────────────────────────────
 function buildApp(d) {
   const app = express();
+  // Sprint 8: shared demo login on every route except GET /healthz and POST /webhooks/paypal (see lib/auth.js).
+  app.use(basicAuth());
 
   // PayPal webhook: keep the raw bytes (signature check), log the delivery, then process idempotently.
   app.post('/webhooks/paypal', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
@@ -884,9 +887,9 @@ function buildApp(d) {
     res.type('html').send(renderDashboard(d, flash));
   });
 
-  // TODO(before real tenants): /api/rent-periods, /api/event-log and the dashboard are public through the
-  // Tailscale Funnel and expose tenant name/email/phone. Fine for fake hackathon seed data only; add auth
-  // before any real tenant data goes in.
+  // TODO(before real tenants): these routes expose tenant name/email/phone. Since Sprint 8 they sit behind
+  // one shared, publicly listed demo login. Fine for fake hackathon seed data only; real tenants need real
+  // per-user auth.
   app.get('/api/rent-periods', (_req, res) => res.json(currentPeriods(d).map((rp) => ({
     ...rp, balance_cents: rp.amount_due_cents - rp.amount_paid_cents,
     payments: d.prepare('SELECT * FROM payment WHERE rent_period_id=? ORDER BY id').all(rp.id),
