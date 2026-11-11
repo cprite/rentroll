@@ -11,6 +11,7 @@
     "ingest-webhooks": "NODE_USE_ENV_PROXY=1 node server.js --ingest-webhook-log"
   },
   "dependencies": {
-    "express": "^4.22.3"
+    "express": "^4.22.3",
+    "pdfkit": "^0.20.2"
   }
 }

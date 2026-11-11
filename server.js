@@ -1,7 +1,8 @@
 // RentRoll server (Sprint 1: data model, dashboard, sandbox capture, webhook ledger;
 // Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js;
 // Sprint 3: landlord approval turns the plan into a server-enforced payment constraint, see approvePlan();
-// Sprint 4: reminder escalation from real ledger state, POST /api/reminders/run, see runReminders() + lib/reminders.js).
+// Sprint 4: reminder escalation from real ledger state, POST /api/reminders/run, see runReminders() + lib/reminders.js;
+// Sprint 6: court packet, GET /api/rent-periods/:id/court-packet.pdf (and .json), see lib/court-packet.js).
 //
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
@@ -24,6 +25,7 @@ import path from 'node:path';
 import { pp } from './lib/paypal.js';
 import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
+import { courtPacketData, renderCourtPacketPdf } from './lib/court-packet.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Raw delivery log, kept for audit (override in tests so fake events never land in the real log).
@@ -594,8 +596,9 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
           const amt = toCents(res.amount?.value);
           const { fee, net } = captureFields(res);
           const id = Number(d.prepare(`INSERT INTO payment (rent_period_id, installment_index, source, status, amount_cents, fee_cents, net_cents,
-              custom_id, paypal_capture_id, paid_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-            .run(Number(m[1]), Number(m[4]), 'paypal_capture', 'COMPLETED', amt, fee, net, res.custom_id, res.id, res.create_time || event.create_time || new Date().toISOString()).lastInsertRowid);
+              custom_id, paypal_capture_id, paypal_order_id, paid_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(Number(m[1]), Number(m[4]), 'paypal_capture', 'COMPLETED', amt, fee, net, res.custom_id, res.id,
+              res.supplementary_data?.related_ids?.order_id ?? null, res.create_time || event.create_time || new Date().toISOString()).lastInsertRowid);
           pay = d.prepare('SELECT * FROM payment WHERE id=?').get(id);
         }
         if (!pay) {
@@ -606,8 +609,10 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
         const { fee, net } = captureFields(res);
         if (completed) {
           d.prepare(`UPDATE payment SET status='COMPLETED', paypal_capture_id=COALESCE(paypal_capture_id, ?), fee_cents=COALESCE(fee_cents, ?),
-              net_cents=COALESCE(net_cents, ?), paid_at=COALESCE(paid_at, ?), webhook_event_id=?, webhook_confirmed_at=? WHERE id=?`)
-            .run(res.id, fee, net, res.create_time || event.create_time || new Date().toISOString(), event.id, new Date().toISOString(), pay.id);
+              net_cents=COALESCE(net_cents, ?), paid_at=COALESCE(paid_at, ?), webhook_event_id=?, webhook_confirmed_at=?,
+              paypal_order_id=COALESCE(paypal_order_id, ?) WHERE id=?`)
+            .run(res.id, fee, net, res.create_time || event.create_time || new Date().toISOString(), event.id, new Date().toISOString(),
+              res.supplementary_data?.related_ids?.order_id ?? null, pay.id);
         } else {
           d.prepare("UPDATE payment SET status='DENIED', webhook_event_id=?, webhook_confirmed_at=?, error='PAYMENT.CAPTURE.DENIED' WHERE id=?")
             .run(event.id, new Date().toISOString(), pay.id);
@@ -683,6 +688,7 @@ header{background:var(--card);border-bottom:1px solid var(--line)}
 .top{display:flex;align-items:center;gap:14px;height:64px}
 .logo{font-weight:800;font-size:20px;letter-spacing:-.3px}.logo span{color:var(--brand)}
 .tag{font-size:12px;color:var(--muted)}.sp{flex:1}
+a.packet{display:inline-block;margin-top:6px;color:var(--brand);text-decoration:none;border:1px solid var(--brand);border-radius:6px;padding:2px 8px;white-space:nowrap}a.packet:hover{background:var(--brand);color:#fff}
 .badge{font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:3px 8px;border-radius:999px;background:#fff4e5;color:var(--warn);border:1px solid #ffd59e}
 h1{font-size:24px;margin:28px 0 4px}.sub{color:var(--muted);margin:0 0 20px}
 .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:22px}
@@ -813,7 +819,8 @@ function renderDashboard(d, flash) {
     const payList = pays.filter((p) => p.status !== 'FAILED').map((p) =>
       `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}</li>`).join('');
     return `<tr>
-      <td><b>${esc(rp.unit_label)}</b><div class="small">${esc(rp.unit_address)}</div></td>
+      <td><b>${esc(rp.unit_label)}</b><div class="small">${esc(rp.unit_address)}</div>
+        <a class="packet small" href="/api/rent-periods/${rp.id}/court-packet.pdf" title="Payment-history PDF from the ledger and PayPal records (not legal advice)">Download court packet (PDF)</a></td>
       <td>${esc(rp.tenant_name)}<div class="small">${esc(rp.tenant_email)}</div></td>
       <td class="num">${money(rp.amount_due_cents)}<div class="small">due ${fmtDate(rp.due_date)}</div></td>
       <td class="num">${money(rp.amount_paid_cents)}<div class="bar"><i style="width:${pct}%"></i></div>${bal > 0 && rp.amount_paid_cents > 0 ? `<div class="small">${money(bal)} left</div>` : ''}</td>
@@ -959,6 +966,28 @@ function buildApp(d) {
       const parts = r.results.map((x) => `${x.unit}: ${x.action === 'drafted' ? `${x.tier} reminder #${x.reminder_number} drafted` : `skipped (${x.reason.split(':')[0].split(' (')[0]})`}`);
       res.redirect(303, `/?ok=${encodeURIComponent(`Reminder check ran on live ledger state. ${parts.join(' · ')}. Drafts are logged only; no SMS/email is sent from this build.`)}`);
     } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
+  });
+  // Sprint 6: court packet (read-only). .json is the exact data the PDF is rendered from.
+  const packet = (req) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'rent period id must be a positive integer');
+    const data = courtPacketData(d, id, { getPeriod, activePlanRow, planSchedule, today });
+    if (!data) throw new HttpError(404, `rent period ${id} not found`);
+    return data;
+  };
+  app.get('/api/rent-periods/:id/court-packet.json', (req, res) => {
+    try { res.json(packet(req)); } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+  });
+  app.get('/api/rent-periods/:id/court-packet.pdf', async (req, res) => {
+    try {
+      const data = packet(req);
+      const pdf = await renderCourtPacketPdf(data);
+      const name = `rentroll-${data.property.unit.replace(/[^A-Za-z0-9]+/g, '-').toLowerCase()}-${data.rent_period.period}-payment-record.pdf`;
+      res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store' }).send(pdf);
+    } catch (e) {
+      if (!e.status) console.error('[court-packet] failed:', e.message);
+      res.status(e.status || 500).json({ ok: false, error: e.status ? e.message : 'court packet generation failed' });
+    }
   });
   app.get('/api/reminders', (_req, res) => res.json(d.prepare("SELECT id, at, rent_period_id, summary, payload_json FROM event_log WHERE kind='reminder_sent' ORDER BY id").all()
     .map((r) => ({ ...r, payload_json: undefined, payload: JSON.parse(r.payload_json) }))));
