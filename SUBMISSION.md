@@ -51,7 +51,7 @@ real money moves.
 1. Pick a unit with a balance and type a message into "Tenant texted", e.g. `can I pay 900 now and the rest on the 15th`.
 2. Read the AI's proposal. It shows the balance it was given and whether the total matches.
 3. Click "Approve plan". The pay form now only accepts the next installment. The unit's PayPal invoice line changes to "partial OK, min $X" and the installment's due date, as read back from PayPal.
-4. Click "Tenant pays installment 1 of 2". A real sandbox card capture runs and is recorded on the PayPal invoice, which goes to PARTIALLY_PAID. The PayPal-confirmed badge shows up once the webhook arrives.
+4. Click "Tenant's page ↗" (or "Copy tenant link" and open it on your phone, or in a narrow window). This is the tenant's own view — no landlord login, a private per-tenant link. From there, click "Pay $X with PayPal (card)". A real sandbox card capture runs and is recorded on the PayPal invoice, which goes to PARTIALLY_PAID. The PayPal-confirmed badge shows up once the webhook arrives, on both the tenant's page and the landlord's dashboard.
 5. Click "Send reminders now" to see drafts picked from each unit's real state.
 6. Click "Download court packet (PDF)" to get a dated record of that unit's messages, plan, reminders and payments, with the PayPal invoice number and current status, PayPal's order/capture ids and webhook verification result.
 
