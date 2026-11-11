@@ -43,7 +43,7 @@ We tested whether the ledger matters. A tenant had paid $800 of $1,800 and asked
 
 The easiest way is the hosted demo: https://nikopi5.tail4aaac7.ts.net/
 
-Your browser will ask for a login — it's given separately, not in this repo. It's one shared demo login, there
+You'll land on a RentRoll sign-in page — the login is given separately, not in this repo. It's one shared demo login, there
 only to keep random visitors off the buttons before a judge gets to it; no test account is needed. It runs on
 PayPal's sandbox, and the "Tenant pays" button charges a PayPal test card, so no real money moves.
 

@@ -47,8 +47,11 @@ LLM_BASE_URL
 LLM_MODEL              # we use nvidia/nemotron-3.5-lightning-30b-a3b
 PUBLIC_BASE_URL        # public https URL PayPal can reach for webhooks
 PORT                   # defaults to 8790
-DEMO_USER              # HTTP Basic Auth login for every page except /healthz and /webhooks/paypal
-DEMO_PASSWORD          # set both on any public deployment; if unset, the login is demo/demo (local dev only)
+DEMO_USER              # shared login (/login page, signed session cookie) for every landlord page; open: /healthz,
+DEMO_PASSWORD          #   /webhooks/paypal, tenant /t/<token> links. Set both on any public deployment; if unset,
+                       #   the login is demo/demo (local dev only). curl/scripts may also send it as HTTP Basic Auth.
+SESSION_SECRET         # optional: HMAC key for the session cookie; if unset, a random one per process start
+                       #   (everyone signs in again after a restart)
 ```
 
 Then:

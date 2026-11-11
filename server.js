@@ -28,7 +28,7 @@ import { pp } from './lib/paypal.js';
 import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
 import { courtPacketData, renderCourtPacketPdf } from './lib/court-packet.js';
-import { basicAuth } from './lib/auth.js';
+import { sessionAuth } from './lib/auth.js';
 import { renderTenantPage } from './lib/tenant-page.js';
 import { invoiceFacts, getInvoice, createAndSendRentInvoice, applyTermsToInvoice, recordPaymentOnInvoice } from './lib/invoicing.js';
 
@@ -1017,6 +1017,7 @@ table.inst{border-radius:8px;margin-bottom:8px}table.inst td,table.inst th{paddi
 form.pay.locked{align-items:center}.lockamt{font-weight:700;padding:6px 10px;border:1px dashed var(--ok);border-radius:8px;background:#f3fbf5}
 .who.landlord{color:var(--ok)}
 .remhdr{display:flex;gap:12px;align-items:center;margin:0 0 12px}.remhdr form{margin:0}
+form.logout{margin:0}form.logout button{background:transparent;color:var(--muted);border:1px solid var(--line)}form.logout button:hover{color:var(--ink);filter:none}
 tr.remrow td{background:#fbfcff;padding:0 16px 16px}
 .rem{border:1px solid var(--line);border-left:4px solid var(--info);border-radius:10px;background:#fff;padding:10px 16px}
 .rem.tier-firm{border-left-color:var(--warn)}.rem.tier-formal{border-left-color:var(--bad);background:#fffafa}
@@ -1129,7 +1130,7 @@ function renderDashboard(d, flash) {
   const feed = events.map((e) => `<li><time>${fmtTime(e.at)}</time><span class="who ${e.actor}">${esc(e.actor)}</span><span>${esc(e.summary)}</span></li>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RentRoll · ${esc(monthName(period))} rent</title><style>${CSS}</style></head><body>
-<header><div class="wrap top"><div class="logo">Rent<span>Roll</span></div><div class="tag">Rent collection for small landlords</div><div class="sp"></div><span class="badge">PayPal sandbox</span></div></header>
+<header><div class="wrap top"><div class="logo">Rent<span>Roll</span></div><div class="tag">Rent collection for small landlords</div><div class="sp"></div><span class="badge">PayPal sandbox</span><form method="post" action="/logout" class="logout"><button>Sign out</button></form></div></header>
 <main class="wrap">
   <h1>${esc(monthName(period))} rent</h1><p class="sub">418 Larkspur Ave · ${rows.length} units · today ${fmtDate(today())}</p>
   ${flash ? `<div class="flash ${flash.ok ? 'ok' : 'err'}">${esc(flash.msg)}</div>` : ''}
@@ -1151,8 +1152,12 @@ function renderDashboard(d, flash) {
 // ───────────────────────────── HTTP ─────────────────────────────
 function buildApp(d) {
   const app = express();
-  // Sprint 8: shared demo login on every route except GET /healthz and POST /webhooks/paypal (see lib/auth.js).
-  app.use(basicAuth());
+  // Shared demo login (Sprint 12: /login page + signed session cookie) on every route except /healthz,
+  // POST /webhooks/paypal, the tenant /t/<token> routes and /login,/logout (see lib/auth.js). The gate never
+  // reads the body, so the webhook's express.raw() below still gets the untouched bytes.
+  const auth = sessionAuth();
+  app.use(auth.gate);
+  auth.routes(app);
 
   // PayPal webhook: keep the raw bytes (signature check), log the delivery, then process idempotently.
   app.post('/webhooks/paypal', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
