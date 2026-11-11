@@ -6,17 +6,17 @@ RentRoll
 
 ## One-line pitch
 
-Small landlords get partial-payment plans that are based on what the tenant has actually paid through PayPal and enforced on every payment, plus a court-ready record.
+Small landlords get partial-payment plans based on what the tenant has actually paid through PayPal. The plans are written onto the real PayPal invoice and enforced on every payment, and the landlord gets a court-ready record.
 
 ## Description
 
 Lots of people with one to four rental units collect rent informally. The tenant sends money over Zelle, Venmo or PayPal, and every month the landlord scrolls through transactions to work out who paid what. When a tenant texts "can I pay 800 now and the rest on the 15th", the deal lives in a text thread. Nobody checks the next payment against it, and if it ends up in small claims court, the landlord is rebuilding the history from screenshots.
 
-RentRoll keeps that history in one place and puts the AI where it's actually useful. The landlord pastes in the tenant's message. Our code reads the month's real balance from completed PayPal payments, and the AI (NVIDIA Nemotron) turns the message into a plan that adds up to that balance. The landlord approves it, and from then on RentRoll will only send PayPal the next installment, for the exact amount. Anything else is refused before PayPal is called. PayPal's signed webhook confirms each payment. Reminders are picked from the real state of the ledger: a friendly nudge inside the grace period, a firm reminder once the late fee applies, a formal notice after two weeks. And one click gives you a dated PDF of every message, plan, reminder and payment for court.
+RentRoll keeps that history in one place and puts the AI where it's actually useful. Each month's rent is a real PayPal invoice, created and sent through the Invoicing API. The landlord pastes in the tenant's message. Our code reads the month's real balance from completed PayPal payments, and the AI (NVIDIA Nemotron) turns the message into a plan that adds up to that balance. When the landlord approves it, RentRoll rewrites the PayPal invoice: partial payment goes on, the minimum amount due becomes the next installment, and the due date becomes that installment's date. RentRoll then reads the invoice back to confirm PayPal stored the change. PayPal only enforces a minimum, not a schedule, so RentRoll also refuses any amount except the next installment before PayPal is called. Each payment is recorded on the invoice, and PayPal's signed webhooks (capture and invoice) are reconciled against a fresh GET of the invoice. Reminders are picked from the real state of the ledger: a friendly nudge inside the grace period, a firm reminder once the late fee applies, a formal notice after two weeks. And one click gives you a dated PDF of every message, plan, reminder and payment for court.
 
 Demo flow: tenant texts a partial-payment ask → AI reads the real PayPal balance and proposes a plan → landlord approves → only the agreed installment gets through to PayPal → reminders escalate off real payment state → one-click court-ready PDF.
 
-What's not there yet: reminders are drafted and logged, not sent (no SMS or email integration), and tenant messages are typed into the dashboard. We planned to use PayPal Invoicing's partial-payment setting, but our sandbox app got `403 NOT_AUTHORIZED` on every Invoicing call, so payments go through the Orders API and our server enforces the plan.
+What's not there yet: reminders are drafted and logged, not sent (no SMS or email integration), and tenant messages are typed into the dashboard. The demo's "Tenant pays" button doesn't pay on PayPal's hosted invoice page. It charges a sandbox test card through the Orders API, and RentRoll then records that capture on the invoice with record-payment. PayPal lists it as an `EXTERNAL` transaction with method `PAYPAL`, and the note names the capture id. The invoice status moves to PARTIALLY_PAID, then to MARKED_AS_PAID. We couldn't test a no-login guest card payment on the hosted invoice page from our build environment. A payment made there would still reach the ledger through the `INVOICING.INVOICE.PAID` webhook.
 
 Two weaknesses we know about:
 
@@ -25,7 +25,7 @@ Two weaknesses we know about:
 
 ## Built With
 
-Node.js, Express, SQLite, pdfkit, PayPal Orders API (sandbox), PayPal Webhooks + signature verification, NVIDIA NIM (`nvidia/nemotron-3.5-lightning-30b-a3b`), Tailscale Funnel
+Node.js, Express, SQLite, pdfkit, PayPal Invoicing API v2 (sandbox), PayPal Orders API (sandbox), PayPal Webhooks + signature verification, NVIDIA NIM (`nvidia/nemotron-3.5-lightning-30b-a3b`), Tailscale Funnel
 
 ## AI tools used and how
 
@@ -46,10 +46,10 @@ real money moves.
 
 1. Pick a unit with a balance and type a message into "Tenant texted", e.g. `can I pay 900 now and the rest on the 15th`.
 2. Read the AI's proposal. It shows the balance it was given and whether the total matches.
-3. Click "Approve plan". The pay form now only accepts the next installment.
-4. Click "Tenant pays installment 1 of 2". A real sandbox capture runs, and the PayPal-confirmed badge shows up once the webhook arrives.
+3. Click "Approve plan". The pay form now only accepts the next installment. The unit's PayPal invoice line changes to "partial OK, min $X" and the installment's due date, as read back from PayPal.
+4. Click "Tenant pays installment 1 of 2". A real sandbox card capture runs and is recorded on the PayPal invoice, which goes to PARTIALLY_PAID. The PayPal-confirmed badge shows up once the webhook arrives.
 5. Click "Send reminders now" to see drafts picked from each unit's real state.
-6. Click "Download court packet (PDF)" to get a dated record of that unit's messages, plan, reminders and payments, with PayPal's order/capture ids and webhook verification result.
+6. Click "Download court packet (PDF)" to get a dated record of that unit's messages, plan, reminders and payments, with the PayPal invoice number and current status, PayPal's order/capture ids and webhook verification result.
 
 To run it yourself, clone the repo and follow `README.md`. You'll need your own PayPal sandbox app and NVIDIA API key. The repo and the hosted demo will stay up through the end of the Judging Period (December 15, 2026).
 

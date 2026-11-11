@@ -2,7 +2,7 @@
 
 Rent collection for landlords with one to four units who take rent over PayPal, Venmo or Zelle and check by hand every month who has paid.
 
-When a tenant writes "can I pay 900 now and the rest on the 15th", RentRoll checks what has actually been paid through PayPal and has an AI turn the message into a payment plan. Once the landlord approves it, only the agreed amounts get through. Reminders are based on what's really been paid, and the whole history can be exported as a dated PDF for small claims court.
+Every month's rent is a real PayPal invoice. When a tenant writes "can I pay 900 now and the rest on the 15th", RentRoll checks what has actually been paid through PayPal and has an AI turn the message into a payment plan. Once the landlord approves it, RentRoll rewrites the PayPal invoice itself (partial payment on, minimum amount due and due date set to the next installment), and only the agreed amounts get through. Reminders are based on what's really been paid, and the whole history can be exported as a dated PDF for small claims court.
 
 Live demo: https://nikopi5.tail4aaac7.ts.net/
 
@@ -13,17 +13,18 @@ real money moves.
 ## What it does
 
 - **The AI reads the ledger first.** Before it proposes anything, our code adds up the completed PayPal payments for that month and gives the model the real balance. The model works out the wording ("the rest later") and our server checks its math. In testing, a tenant who'd already paid $800 of $1,800 asked to pay "900 now and the rest later". RentRoll proposed $900 + $100. The same model without the ledger proposed $900 + $900, overcharging by $800, and our validator rejects that plan. (Details in `SPRINT2.md`.)
-- **Approving a plan locks the amount.** After approval, the only payment RentRoll will send to PayPal is the next installment, for the exact amount. In the sandbox, $1,800 and $500 were refused, and $900 went through and was confirmed by PayPal's signed webhook. (`SPRINT3.md`)
+- **One PayPal invoice per unit per month.** RentRoll creates and sends a PayPal invoice (Invoicing API v2) for each rent period, starting as "pay in full", and stores its id and number. (`SPRINT10.md`)
+- **Approving a plan changes the real invoice.** On approval RentRoll PUTs the invoice's `configuration.partial_payment` (allow partial payment, `minimum_amount_due` = the next installment) and its due date, then GETs it back to check that PayPal stored them. In the sandbox an $1,800 invoice went from "full amount, due Nov 1" to "minimum $900.00, due Nov 11". After installment 1 was paid, the due date moved to Nov 15. PayPal only enforces a minimum amount, not a schedule, so the schedule itself lives in RentRoll, and RentRoll also refuses any amount except the next installment before calling PayPal. In the sandbox, $1,800 was refused and $900 went through. (`SPRINT3.md`, `SPRINT10.md`)
 - **Reminders follow the money.** Each run re-reads the payments and picks a tone: a friendly nudge inside the grace period, a firm reminder once the late fee applies, a formal notice after two weeks. If nothing changed in the last 24 hours, it skips the unit. (`SPRINT4.md`)
-- **Court packet.** The "Download court packet (PDF)" link on each unit gives you a dated PDF of every message, plan, reminder and payment, with PayPal's order/capture ids, webhook signature-verification result, and a SHA-256 over the included ledger rows. (`SPRINT6.md`)
+- **Court packet.** The "Download court packet (PDF)" link on each unit gives you a dated PDF of every message, plan, reminder and payment. It includes the PayPal invoice number, id and status (read live from PayPal when the packet is made), PayPal's order/capture ids and invoice payment ids, the webhook signature-verification result, and a SHA-256 over the included ledger rows. (`SPRINT6.md`, `SPRINT10.md`)
 
-PayPal webhooks are signature-checked and deduplicated, and the event log is append-only.
+PayPal webhooks are signature-checked and deduplicated, and the event log is append-only. For `INVOICING.INVOICE.*` events RentRoll ignores the amounts in the payload. It GETs the invoice and reconciles every transaction on it against its own ledger. A payment recorded directly on the PayPal invoice, for example cash the landlord logged in PayPal, gets added to the ledger.
 
 ## What it doesn't do yet
 
 - Reminders are drafted and logged, not sent. There's no SMS or email integration, and you run them with the "Send reminders now" button.
 - Tenant messages are typed into the dashboard. Nothing receives real texts.
-- Tenant payments are sandbox card captures through the PayPal Orders API. We meant to use PayPal Invoicing and its partial-payment setting, but our sandbox app got `403 NOT_AUTHORIZED` on every Invoicing call. So the plan is enforced by our server before it calls Orders.
+- **The tenant's card is charged through Orders, not on PayPal's hosted invoice page.** "Tenant pays" charges a PayPal sandbox test card with the Orders API (no buyer login needed). RentRoll then records that capture on the invoice with Invoicing's record-payment call, and the invoice goes to PARTIALLY_PAID, then to MARKED_AS_PAID. PayPal lists these as `EXTERNAL` transactions with method `PAYPAL`, and the note on each names the Orders capture id. PayPal returns 404 if the capture id is passed as the payment id. We couldn't test whether a guest can pay the hosted invoice page with a card and no login: there was no browser in our build sandbox and we have no sandbox buyer account. If a tenant does pay there, the `INVOICING.INVOICE.PAID` webhook plus the GET adds that payment to the ledger. That path is coded, but only tested with a payment recorded directly on PayPal's side.
 
 ## Two honest weaknesses
 
@@ -56,7 +57,7 @@ Then:
 npm install && ./start.sh
 ```
 
-On first start it creates `data/rentroll.db` with three demo tenants. `npm run reset` wipes it and starts over.
+On first start it creates `data/rentroll.db` with three demo tenants and creates and sends one PayPal sandbox invoice per rent period. Your sandbox app needs the Invoicing feature enabled. `RENTROLL_INVOICING=0` turns every Invoicing call off. `node server.js --open-month 2026-12` opens the next month's rent periods and their invoices. `npm run reset` wipes it and starts over.
 
 For webhooks, register one at `$PUBLIC_BASE_URL/webhooks/paypal` (`node scripts/sprint0-webhook.mjs` does it) and put its id in `PAYPAL_WEBHOOK_ID`. Webhooks with a bad signature are rejected. Payments still work without them, they just won't get the "PayPal confirmed" badge.
 
