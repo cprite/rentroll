@@ -788,7 +788,7 @@ function renderReminderRow(d, rp) {
   const stillOwed = rp.amount_due_cents - rp.amount_paid_cents > 0;
   return `<tr class="remrow"><td colspan="6"><div class="rem tier-${r.tier}">
     <div class="plan-h"><span><span class="pill tier-${r.tier}">${esc(TIER_LABEL[r.tier] || r.tier)}</span>
-      <span class="small"> reminder #${r.reminder_number} · ${r.days_overdue} day${r.days_overdue === 1 ? '' : 's'} overdue · ${money(r.owed_cents)} owed${r.late_fee_applicable ? ` · ${money(r.late_fee_cents)} late fee applies` : ''}${r.target?.kind === 'plan_installment' ? ` · plan #${r.target.plan_id} installment ${r.target.installment}` : ''}</span></span>
+      <span class="small"> #${r.reminder_number} for this amount · ${r.days_overdue} day${r.days_overdue === 1 ? '' : 's'} overdue · ${money(r.owed_cents)} owed${r.late_fee_applicable ? ` · ${money(r.late_fee_cents)} late fee applies` : ''}${r.target?.kind === 'plan_installment' ? ` · plan #${r.target.plan_id} installment ${r.target.installment}` : ''}</span></span>
       <span class="small">${fmtTime(r.at)} · ${r.total} logged for this period</span></div>
     <blockquote class="remtxt">${esc(r.text)}</blockquote>
     <div class="small">${r.drafted_by === 'llm' ? 'Drafted by AI from the ledger facts above' : `Template fallback (${esc(r.fallback_reason || 'AI draft unavailable')})`} · SMS to ${esc(r.to || 'tenant')} · <b>drafted and logged only, not delivered</b> (no SMS/email integration in this build)${stillOwed ? '' : ' · <span class="ok-ic">since paid, no further reminders</span>'}</div>
