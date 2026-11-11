@@ -43,10 +43,9 @@ We tested whether the ledger matters. A tenant had paid $800 of $1,800 and asked
 
 The easiest way is the hosted demo: https://nikopi5.tail4aaac7.ts.net/
 
-Your browser will ask for a login — it's given in this submission's judges-only testing-instructions field on
-Devpost, not here. It's one shared demo login, there only to keep random visitors off the buttons; no test
-account is needed. It runs on PayPal's sandbox, and the "Tenant pays" button charges a PayPal test card, so no
-real money moves.
+Your browser will ask for a login: **`reviewer-752a` / `l-xVtwNhns2EVMDc`**. It's one shared demo login, there
+only to keep random visitors off the buttons before a judge gets to it; no test account is needed. It runs on
+PayPal's sandbox, and the "Tenant pays" button charges a PayPal test card, so no real money moves.
 
 1. Pick a unit with a balance and type a message into "Tenant texted", e.g. `can I pay 900 now and the rest on the 15th`.
 2. Read the AI's proposal. It shows the balance it was given and whether the total matches.

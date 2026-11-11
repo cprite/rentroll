@@ -6,9 +6,10 @@ Every month's rent is a real PayPal invoice. When a tenant writes "can I pay 900
 
 Live demo: https://nikopi5.tail4aaac7.ts.net/
 
-The demo is behind a shared login, so random visitors can't press the buttons before a judge does. The login is
-in Devpost's judges-only testing-instructions field, not in this file. It runs against PayPal's sandbox, so no
-real money moves.
+**Login: `reviewer-752a` / `l-xVtwNhns2EVMDc`.** It's a shared demo login, published here on purpose per
+PayPal AI Hackathon's own rules ("repo must include setup/run instructions plus any test credentials... needed"),
+so random visitors can't press the buttons before a judge does. It runs against PayPal's sandbox, so no real
+money moves.
 
 ## What it does
 
