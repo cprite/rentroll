@@ -542,7 +542,8 @@ async function ensureInvoice(d, rpId) {
   if (!rp || rp.paypal_invoice_id || invoiceInFlight.has(rpId)) return null;
   invoiceInFlight.add(rpId);
   try {
-    const number = `RR-${rp.period}-U${rp.unit_id}-RP${rp.id}-${Date.now().toString(36).toUpperCase()}`;
+    // PayPal: "Invoice number length should be less than 25 characters" (400 INVALID_STRING_MAX_LENGTH, 2026-11-11).
+    const number = `RR${rp.period.replace('-', '')}U${rp.unit_id}P${rp.id}-${Date.now().toString(36).toUpperCase().slice(-6)}`.slice(0, 24);
     const r = await createAndSendRentInvoice(rp, { invoiceNumber: number });
     const f = invoiceFacts(r.invoice);
     tx(d, () => {

@@ -23,6 +23,7 @@ for i in $(seq 1 30); do curl -s $U/healthz >/dev/null && break; sleep 0.5; done
 for i in $(seq 1 60); do [ "$(grep -c '\[invoice\]' "$T/server.log")" -ge 3 ] && break; sleep 1; done
 echo "=== 1. server up $(date -u +%H:%M:%SZ); startup created + sent one PayPal invoice per rent period ==="
 grep '\[invoice\]' "$T/server.log" | sed 's/^/  /'
+[ "$(grep -c '"invoice_id"' "$T/server.log")" -ge 3 ] || { echo 'ABORT: not every rent period got a PayPal invoice'; exit 1; }
 echo '$ GET /api/rent-periods/1001/invoice   (live GET from PayPal, before any plan)'; inv
 
 echo '=== 2. tenant message -> AI plan ==='
