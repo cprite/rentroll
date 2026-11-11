@@ -1,6 +1,7 @@
 // RentRoll server (Sprint 1: data model, dashboard, sandbox capture, webhook ledger;
 // Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js;
-// Sprint 3: landlord approval turns the plan into a server-enforced payment constraint, see approvePlan()).
+// Sprint 3: landlord approval turns the plan into a server-enforced payment constraint, see approvePlan();
+// Sprint 4: reminder escalation from real ledger state, POST /api/reminders/run, see runReminders() + lib/reminders.js).
 //
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
@@ -22,6 +23,7 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { pp } from './lib/paypal.js';
 import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
+import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Raw delivery log, kept for audit (override in tests so fake events never land in the real log).
@@ -192,6 +194,9 @@ const SEED_UNITS = [
     tenant: { name: 'Jordan Ellis', email: 'jordan.ellis@tenant.example.com', phone: '+1-614-555-0142' } },
   { label: 'Unit 3', address: '418 Larkspur Ave, Apt 3, Columbus, OH 43206', rent: 120000,
     tenant: { name: 'Priya Nair', email: 'priya.nair@tenant.example.com', phone: '+1-614-555-0187' } },
+  // Sprint 4: rent due on the 8th, so on a given day this unit sits in a different reminder tier than Units 2/3.
+  { label: 'Unit 4', address: '418 Larkspur Ave, Apt 4, Columbus, OH 43206', rent: 95000, due_day: 8,
+    tenant: { name: 'Sam Okafor', email: 'sam.okafor@tenant.example.com', phone: '+1-614-555-0119' } },
 ];
 const LATE_FEE = { grace_days: 5, type: 'flat', value_cents: 7500, state: 'OH' };
 
@@ -202,12 +207,13 @@ function seed(d) {
       const tenantId = Number(d.prepare('INSERT INTO tenant (name, email, phone) VALUES (?,?,?)')
         .run(u.tenant.name, u.tenant.email, u.tenant.phone).lastInsertRowid);
       const unitId = Number(d.prepare('INSERT INTO unit (label, address, monthly_rent_cents, due_day, late_fee_rule_json, tenant_id) VALUES (?,?,?,?,?,?)')
-        .run(u.label, u.address, u.rent, 1, JSON.stringify(LATE_FEE), tenantId).lastInsertRowid);
+        .run(u.label, u.address, u.rent, u.due_day ?? 1, JSON.stringify(LATE_FEE), tenantId).lastInsertRowid);
+      const dueDate = `${SEED_PERIOD}-${String(u.due_day ?? 1).padStart(2, '0')}`;
       d.prepare('UPDATE tenant SET unit_id=? WHERE id=?').run(unitId, tenantId);
       const rpId = Number(d.prepare('INSERT INTO rent_period (unit_id, tenant_id, period, due_date, amount_due_cents) VALUES (?,?,?,?,?)')
-        .run(unitId, tenantId, SEED_PERIOD, `${SEED_PERIOD}-01`, u.rent).lastInsertRowid);
+        .run(unitId, tenantId, SEED_PERIOD, dueDate, u.rent).lastInsertRowid);
       logEvent(d, { kind: 'seed', actor: 'system', rent_period_id: rpId,
-        summary: `${monthName(SEED_PERIOD)} rent opened for ${u.label} (${u.tenant.name}): ${money(u.rent)} due ${SEED_PERIOD}-01`,
+        summary: `${monthName(SEED_PERIOD)} rent opened for ${u.label} (${u.tenant.name}): ${money(u.rent)} due ${dueDate}`,
         payload: { unit_id: unitId, tenant_id: tenantId } });
     }
     return SEED_UNITS.length;
@@ -492,6 +498,62 @@ async function handleTenantMessage(d, rpId, body, channel = 'sms') {
     tenant_stated: r.tenant_stated ?? null, adjusted: r.adjusted ?? null };
 }
 
+// ───────────────────────────── reminder escalation (Sprint 4) ─────────────────────────────
+// Manually / dashboard-triggered check (no fake background scheduler). Every decision is recomputed from the
+// payments table + event_log at run time; see lib/reminders.js.
+let reminderRunActive = false;
+async function runReminders(d, { dryRun = false } = {}) {
+  if (reminderRunActive) throw new HttpError(409, 'a reminder run is already in progress');
+  reminderRunActive = true;
+  try {
+    const runAt = new Date().toISOString(), t = today();
+    const deps = { activePlanRow, planSchedule };
+    const ids = d.prepare('SELECT id FROM rent_period ORDER BY unit_id, period').all().map((r) => r.id);
+    const results = [];
+    for (const id of ids) {
+      const st = reminderState(d, id, t, deps);
+      const head = { rent_period_id: id, unit: st.unit, tenant: st.tenant, period: st.period };
+      const facts = { open_balance_cents: st.open_balance_cents, owed_cents: st.target?.owed_cents ?? null, target_key: st.target?.key ?? null,
+        due_date: st.target?.due_date ?? null, days_overdue: st.days_overdue ?? null, tier: st.tier ?? null, late_fee_applicable: st.late_fee_applicable ?? false,
+        prior_reminders: st.prior_reminders ?? 0, last_reminder_at: st.last_reminder_at ?? null, last_reminder_event_id: st.last_reminder_event_id ?? null,
+        hours_since_last: st.hours_since_last ?? null, changed_since_last: st.changed_since_last ?? null, cached_status: st.cached_status };
+      if (st.skip) { results.push({ ...head, action: 'skipped', reason: st.skip, ...facts }); continue; }
+      if (dryRun) { results.push({ ...head, action: 'would_draft', ...facts }); continue; }
+      const draft = await draftReminder(st);
+      // The LLM call took seconds; money may have moved. Re-check and write atomically.
+      const out = tx(d, () => {
+        const now = reminderState(d, id, today(), deps);
+        if (now.skip || now.target.key !== st.target.key || now.target.owed_cents !== st.target.owed_cents || now.tier !== st.tier)
+          return { ...head, action: 'discarded', reason: `state changed while drafting: ${now.skip || 'amount/tier changed'}`, ...facts };
+        const n = now.prior_reminders + 1;
+        const tgt = now.target.kind === 'plan_installment' ? `plan #${now.target.plan_id} installment ${now.target.installment} of ${now.target.installments_total}` : `${monthName(now.period)} rent`;
+        const payload = { target_key: now.target.key, target: now.target, tier: now.tier, days_overdue: now.days_overdue, owed_cents: now.target.owed_cents,
+          open_balance_cents: now.open_balance_cents, paid_cents: now.paid_cents, late_fee_applicable: now.late_fee_applicable, late_fee_cents: now.late_fee_cents,
+          reminder_number: n, previous_reminder_event_id: now.last_reminder_event_id, previous_reminder_at: now.last_reminder_at, changed_since_last: now.changed_since_last ?? null,
+          today: now.today, run_at: runAt, channel: 'sms', to: now.tenant_phone,
+          delivery: 'not_sent: no SMS/email integration in this build; drafted and logged only',
+          text: draft.text, drafted_by: draft.drafted_by, fallback_reason: draft.fallback_reason ?? null, llm: { model: draft.model ?? null, attempts: draft.attempts } };
+        const eid = Number(d.prepare('INSERT INTO event_log (kind, actor, rent_period_id, summary, payload_json) VALUES (?,?,?,?,?)').run('reminder_sent', 'ai', id,
+          `Reminder #${n} drafted and logged (${now.tier.toUpperCase()}, ${now.days_overdue} day${now.days_overdue === 1 ? '' : 's'} overdue, ${money(now.target.owed_cents)} for ${tgt}) for ${now.tenant}. Would be sent by SMS in production; not delivered: "${draft.text.slice(0, 140)}${draft.text.length > 140 ? '…' : ''}"`,
+          JSON.stringify(payload)).lastInsertRowid);
+        return { ...head, action: 'drafted', event_log_id: eid, reminder_number: n, drafted_by: draft.drafted_by, fallback_reason: draft.fallback_reason ?? null,
+          text: draft.text, delivery: payload.delivery, ...facts };
+      });
+      results.push(out);
+    }
+    return { ok: true, run_at: runAt, today: t, dry_run: dryRun, rate_limit_hours: RATE_LIMIT_HOURS(),
+      drafted: results.filter((r) => r.action === 'drafted').length, would_draft: results.filter((r) => r.action === 'would_draft').length,
+      skipped: results.filter((r) => r.action === 'skipped' || r.action === 'discarded').length, results };
+  } finally { reminderRunActive = false; }
+}
+
+const latestReminder = (d, rpId) => {
+  const r = d.prepare("SELECT id, at, payload_json FROM event_log WHERE kind='reminder_sent' AND rent_period_id=? ORDER BY id DESC LIMIT 1").get(rpId);
+  if (!r) return null;
+  const p = JSON.parse(r.payload_json);
+  return { ...p, id: r.id, at: r.at, total: d.prepare("SELECT COUNT(*) n FROM event_log WHERE kind='reminder_sent' AND rent_period_id=?").get(rpId).n };
+};
+
 // ───────────────────────────── webhooks ─────────────────────────────
 async function verifySignature(headers, rawBody) {
   const h = (k) => headers?.[k];
@@ -663,6 +725,12 @@ table.inst{border-radius:8px;margin-bottom:8px}table.inst td,table.inst th{paddi
 .pill.inst-UPCOMING{background:#f1f2f5;color:var(--muted)}.pill.inst-PROCESSING{background:#fff4e5;color:var(--warn)}
 form.pay.locked{align-items:center}.lockamt{font-weight:700;padding:6px 10px;border:1px dashed var(--ok);border-radius:8px;background:#f3fbf5}
 .who.landlord{color:var(--ok)}
+.remhdr{display:flex;gap:12px;align-items:center;margin:0 0 12px}.remhdr form{margin:0}
+tr.remrow td{background:#fbfcff;padding:0 16px 16px}
+.rem{border:1px solid var(--line);border-left:4px solid var(--info);border-radius:10px;background:#fff;padding:10px 16px}
+.rem.tier-firm{border-left-color:var(--warn)}.rem.tier-formal{border-left-color:var(--bad);background:#fffafa}
+.pill.tier-friendly{background:#e8f1fd;color:var(--info)}.pill.tier-firm{background:#fff4e5;color:var(--warn)}.pill.tier-formal{background:#fdecea;color:var(--bad)}
+.remtxt{margin:6px 0;padding:6px 12px;border-left:3px solid var(--line);font-size:14px}
 @media(max-width:820px){.kpis{grid-template-columns:1fr}table,thead,tbody,tr,td{display:block}thead{display:none}td{border:0;padding:8px 16px}tr{border-bottom:1px solid var(--line);padding:8px 0}.num{text-align:left}}
 `;
 
@@ -713,6 +781,20 @@ function renderApprovedPlan(rp, p) {
   </div></td></tr>`;
 }
 
+const TIER_LABEL = { friendly: 'Friendly nudge', firm: 'Firm reminder', formal: 'Formal notice' };
+function renderReminderRow(d, rp) {
+  const r = latestReminder(d, rp.id);
+  if (!r) return '';
+  const stillOwed = rp.amount_due_cents - rp.amount_paid_cents > 0;
+  return `<tr class="remrow"><td colspan="6"><div class="rem tier-${r.tier}">
+    <div class="plan-h"><span><span class="pill tier-${r.tier}">${esc(TIER_LABEL[r.tier] || r.tier)}</span>
+      <span class="small"> reminder #${r.reminder_number} · ${r.days_overdue} day${r.days_overdue === 1 ? '' : 's'} overdue · ${money(r.owed_cents)} owed${r.late_fee_applicable ? ` · ${money(r.late_fee_cents)} late fee applies` : ''}${r.target?.kind === 'plan_installment' ? ` · plan #${r.target.plan_id} installment ${r.target.installment}` : ''}</span></span>
+      <span class="small">${fmtTime(r.at)} · ${r.total} logged for this period</span></div>
+    <blockquote class="remtxt">${esc(r.text)}</blockquote>
+    <div class="small">${r.drafted_by === 'llm' ? 'Drafted by AI from the ledger facts above' : `Template fallback (${esc(r.fallback_reason || 'AI draft unavailable')})`} · SMS to ${esc(r.to || 'tenant')} · <b>drafted and logged only, not delivered</b> (no SMS/email integration in this build)${stillOwed ? '' : ' · <span class="ok-ic">since paid, no further reminders</span>'}</div>
+  </div></td></tr>`;
+}
+
 function renderDashboard(d, flash) {
   const rows = currentPeriods(d);
   const period = rows[0]?.period || SEED_PERIOD;
@@ -744,7 +826,7 @@ function renderDashboard(d, flash) {
           <input name="amount" inputmode="decimal" value="${(bal / 100).toFixed(2)}" aria-label="Amount in dollars"><button>Tenant pays</button></form>`}
         <form class="pay msg" method="post" action="/rent-periods/${rp.id}/messages" title="Simulates an incoming tenant text; the AI drafts a plan from the live balance">
           <input name="body" placeholder="Tenant texts… e.g. can I pay 900 now and the rest later" aria-label="Tenant message"><button class="ghost">Tenant texted</button></form>` : ''}</td>
-    </tr>${renderPlanRow(d, rp)}`;
+    </tr>${renderPlanRow(d, rp)}${renderReminderRow(d, rp)}`;
   }).join('');
   const feed = events.map((e) => `<li><time>${fmtTime(e.at)}</time><span class="who ${e.actor}">${esc(e.actor)}</span><span>${esc(e.summary)}</span></li>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -758,6 +840,8 @@ function renderDashboard(d, flash) {
     <div class="kpi"><small>Outstanding</small><b>${money(due - paid)}</b><small>${rows.length - paidUnits} unit${rows.length - paidUnits === 1 ? '' : 's'} still owe rent</small></div>
     <div class="kpi"><small>Paid in full</small><b>${paidUnits} / ${rows.length}</b><small>units this month</small></div>
   </section>
+  <div class="remhdr"><form method="post" action="/reminders/run" title="Checks every unit's live balance, days overdue and reminders already sent, then drafts only the reminders that are due"><button>Send reminders now</button></form>
+    <span class="small">Reads the live ledger: who owes what, days overdue, late-fee grace, and reminders already sent (max one per ${RATE_LIMIT_HOURS()} h per unchanged balance). Drafts are logged; no SMS/email integration yet.</span></div>
   <table><thead><tr><th>Unit</th><th>Tenant</th><th class="num">Due</th><th class="num">Paid</th><th>Status</th><th>Next action</th></tr></thead><tbody>${trs}</tbody></table>
   <h2>Ledger</h2><ul class="feed">${feed || '<li>No activity yet.</li>'}</ul>
   <footer>Every payment and PayPal webhook is written to an append-only ledger. "Tenant pays" charges PayPal's sandbox test card. No real money moves.</footer>
@@ -863,6 +947,21 @@ function buildApp(d) {
       catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
     });
   }
+
+  // Sprint 4: reminder escalation check. JSON API (?dry_run=1 computes the decisions without drafting/logging).
+  app.post('/api/reminders/run', async (req, res) => {
+    try { res.json(await runReminders(d, { dryRun: ['1', 'true'].includes(String(req.query.dry_run)) })); }
+    catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+  });
+  app.post('/reminders/run', async (_req, res) => {
+    try {
+      const r = await runReminders(d);
+      const parts = r.results.map((x) => `${x.unit}: ${x.action === 'drafted' ? `${x.tier} reminder #${x.reminder_number} drafted` : `skipped (${x.reason.split(':')[0].split(' (')[0]})`}`);
+      res.redirect(303, `/?ok=${encodeURIComponent(`Reminder check ran on live ledger state. ${parts.join(' · ')}. Drafts are logged only; no SMS/email is sent from this build.`)}`);
+    } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
+  });
+  app.get('/api/reminders', (_req, res) => res.json(d.prepare("SELECT id, at, rent_period_id, summary, payload_json FROM event_log WHERE kind='reminder_sent' ORDER BY id").all()
+    .map((r) => ({ ...r, payload_json: undefined, payload: JSON.parse(r.payload_json) }))));
 
   // Body-parser and other uncaught errors: plain JSON, never Express's HTML page with a stack trace.
   app.use((err, _req, res, _next) => {
