@@ -87,7 +87,7 @@ waiting up to 120 s for PayPal's webhook for capture 0X1983614E899745P in the li
   4. Verification returned SUCCESS, and the payment is now webhook-confirmed.
 
 ### Side effect on the real DB, and something hack-lead should know
-- The real `data/rentroll.db` has **2–3 new `webhook_received` rows with `rent_period_id NULL`**, each reading "did not match any RentRoll payment" (`custom_id RR:rp941…`). These are the live service correctly recording the webhooks for my test captures. It is the same harmless pattern as in earlier sprints. My code never writes to the real DB.
+- The real `data/rentroll.db` has **3 new `webhook_received` rows (one per test capture across my 3 test runs) with `rent_period_id NULL`**, each reading "did not match any RentRoll payment" (`custom_id RR:rp941…`). These are the live service correctly recording the webhooks for my test captures. It is the same harmless pattern as in earlier sprints. My code never writes to the real DB.
 - **The live webhook pipeline works again.** TESTER3 saw no deliveries between 01:10 and 01:14Z. Tonight, real signed deliveries reached the live service about 16–18 s after each capture, with verification SUCCESS. That supports "confirmed by PayPal" in the demo.
 - **The running `rentroll.service` is still on the old code.** The new route and the dashboard link only go live once the service is restarted on this branch (after merge), and `npm install` must be run first because the build now depends on `pdfkit`. That is hack-lead's step; I did not restart anything.
 
