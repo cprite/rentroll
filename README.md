@@ -1,5 +1,9 @@
 # RentRoll
 
+![RentRoll](docs/images/hero.jpg)
+
+🏆 Entry for the [PayPal AI Hackathon 2026](https://paypalaihackathon.devpost.com/) on Devpost · [Demo video](https://youtu.be/Eo3NTko7bwI)
+
 Rent collection for landlords with one to four units who take rent over PayPal, Venmo or Zelle and check by hand every month who has paid.
 
 Every month's rent is a real PayPal invoice. When a tenant writes "can I pay 900 now and the rest on the 15th", RentRoll checks what has actually been paid through PayPal and has an AI turn the message into a payment plan. Once the landlord approves it, RentRoll rewrites the PayPal invoice itself (partial payment on, minimum amount due and due date set to the next installment), and only the agreed amounts get through. Reminders are based on what's really been paid, and the whole history can be exported as a dated PDF for small claims court.
@@ -19,6 +23,21 @@ sandbox, so no real money moves.
 - **Court packet.** The "Download court packet (PDF)" link on each unit gives you a dated PDF of every message, plan, reminder and payment. It includes the PayPal invoice number, id and status (read live from PayPal when the packet is made), PayPal's order/capture ids and invoice payment ids, the webhook signature-verification result, and a SHA-256 over the included ledger rows. (`SPRINT6.md`, `SPRINT10.md`)
 
 PayPal webhooks are signature-checked and deduplicated, and the event log is append-only. For `INVOICING.INVOICE.*` events RentRoll ignores the amounts in the payload. It GETs the invoice and reconciles every transaction on it against its own ledger. A payment recorded directly on the PayPal invoice, for example cash the landlord logged in PayPal, gets added to the ledger.
+
+## Screenshots
+
+<table>
+<tr>
+<td width="33%"><img src="docs/images/screenshot-dashboard.jpg" width="100%" alt="Landlord dashboard"></td>
+<td width="33%"><img src="docs/images/screenshot-tenant.jpg" width="100%" alt="Tenant's phone page"></td>
+<td width="33%"><img src="docs/images/screenshot-court-packet.jpg" width="100%" alt="Court-ready PDF"></td>
+</tr>
+<tr>
+<td>Landlord desktop: one real PayPal invoice per unit, an AI-proposed plan, and the installment it enforces.</td>
+<td>Tenant's own phone page: no landlord login, their own message, the approved plan, the locked payment.</td>
+<td>A dated, court-ready PDF with PayPal's own invoice, order and capture ids, and a webhook verification result.</td>
+</tr>
+</table>
 
 ## What it doesn't do yet
 
