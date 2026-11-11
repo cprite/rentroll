@@ -674,7 +674,12 @@ async function handleInvoiceEvent(d, event, { verification, via }) {
         if (pay) d.prepare('UPDATE payment SET invoice_payment_id=COALESCE(invoice_payment_id, ?) WHERE id=?').run(t.payment_id, pay.id);
       }
       if (pay) {
-        d.prepare('UPDATE payment SET invoice_webhook_event_id=COALESCE(invoice_webhook_event_id, ?) WHERE id=?').run(event.id, pay.id);
+        // Don't let a stale/precursor event (e.g. CREATED replayed before the payment existed) win this slot
+        // over a later event that actually post-dates the payment being recorded.
+        const evTime = event.create_time || null;
+        if (!pay.invoice_webhook_event_id && (!pay.invoice_recorded_at || !evTime || evTime >= pay.invoice_recorded_at)) {
+          d.prepare('UPDATE payment SET invoice_webhook_event_id=? WHERE id=?').run(event.id, pay.id);
+        }
         matched.push({ payment_id: pay.id, invoice_payment_id: t.payment_id });
         continue;
       }
