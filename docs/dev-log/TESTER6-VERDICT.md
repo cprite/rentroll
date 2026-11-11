@@ -91,7 +91,7 @@ INVOICING.INVOICE.UPDATED WH-3RK851153B776352N-10X06651SY568992K -> invoice_reco
   - `POST /webhooks/paypal` (empty body) → 400, from the route itself rather than auth.
 
 ## 7. Honesty check: PASS (one minor wording issue, see finding B)
-README.md:27 and SUBMISSION.md:19 say plainly that:
+README.md:27 and ../SUBMISSION.md:19 say plainly that:
 - the card is charged through Orders, not on the hosted invoice page;
 - the payment is recorded with record-payment as `EXTERNAL`/`PAYPAL`, with the capture id in the note;
 - the final status is `MARKED_AS_PAID`;
@@ -107,7 +107,7 @@ All of that matches what I saw on PayPal. README.md:17 says "PayPal only enforce
   - In replay order the old CREATED event comes after the capture. The builder's run had the same issue (SENT event `WH-4FG756…`).
   - Live, events arrive in time order, so this mostly affects backfills.
   - Suggested fix (post-merge OK): only set it when `event.create_time >= payment.invoice_recorded_at`, or prefer `INVOICING.INVOICE.PAID`.
-- **B. (wording)** SUBMISSION.md:19, "A payment made there would still reach the ledger through the INVOICING.INVOICE.PAID webhook", is stated as fact.
+- **B. (wording)** ../SUBMISSION.md:19, "A payment made there would still reach the ledger through the INVOICING.INVOICE.PAID webhook", is stated as fact.
   - README.md:27 adds the correct qualifier: "coded, but only tested with a payment recorded directly on PayPal's side".
   - Suggest adding the same qualifier to SUBMISSION.
 - **C. (deploy note, already in SPRINT10)** The live service still runs the pre-Invoicing build. Until this branch is deployed, live

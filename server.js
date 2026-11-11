@@ -15,7 +15,7 @@
 //   node server.js --ensure-invoices     create + send a PayPal invoice for every rent period that has none, exit
 //   node server.js --open-month 2026-12  open next month's rent periods (one per unit) + their PayPal invoices, exit
 //
-// INVOICING (Sprint 10, see lib/invoicing.js and SPRINT10.md). RENTROLL_INVOICING=0 turns every Invoicing call
+// INVOICING (Sprint 10, see lib/invoicing.js and docs/dev-log/SPRINT10.md). RENTROLL_INVOICING=0 turns every Invoicing call
 // off (offline tests). The tenant's card charge still runs through Orders (no logged-in buyer needed); the
 // capture is then recorded on the invoice with record-payment, so the invoice itself carries the payment.
 import express from 'express';

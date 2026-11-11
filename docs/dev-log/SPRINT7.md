@@ -1,6 +1,6 @@
 # SPRINT 7: README and SUBMISSION (2026-11-11)
 
-Branch `sprint7-polish`. Wrote `README.md` and `SUBMISSION.md` (Devpost text) with the Sepia skill. LICENSE not touched.
+Branch `sprint7-polish`. Wrote `README.md` and `../SUBMISSION.md` (Devpost text) with the Sepia skill. LICENSE not touched.
 
 Facts come from SPRINT0-4, SPRINT1-FIX, TESTER1/TESTER3 verdicts, BRIEF.md, RULES.md, HANDOFF.md.
 

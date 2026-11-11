@@ -11,7 +11,7 @@ DEMO_USER=judge
 DEMO_PASSWORD=8c8r45j5md
 ```
 
-This is not a secret. It is published in README.md and SUBMISSION.md for judges. (I can't write to that file from my sandbox.)
+This is not a secret. It is published in README.md and ../SUBMISSION.md for judges. (I can't write to that file from my sandbox.)
 If the service starts without these two variables, the login falls back to `demo` / `demo` and logs
 `[auth] DEMO_USER/DEMO_PASSWORD not set: using local-dev login demo/demo`. Then the published login won't work, so set them before restarting.
 
@@ -22,7 +22,7 @@ If the service starts without these two variables, the login falls back to `demo
   A missing or wrong login gets `401`, `WWW-Authenticate: Basic realm="RentRoll"`, and a plain-text body. No new dependencies.
 - `server.js`: imports it and adds `app.use(basicAuth())` as the first middleware in `buildApp`. No route or handler changed.
   I also updated the TODO comment about the public routes.
-- `README.md`, `SUBMISSION.md`: replaced the "No login" lines with the published login and added the two env vars to the README env list.
+- `README.md`, `../SUBMISSION.md`: replaced the "No login" lines with the published login and added the two env vars to the README env list.
 
 ## Routes left open, and why
 
