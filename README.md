@@ -6,7 +6,9 @@ When a tenant writes "can I pay 900 now and the rest on the 15th", RentRoll chec
 
 Live demo: https://nikopi5.tail4aaac7.ts.net/
 
-Login: user `judge`, password `8c8r45j5md`. It's a shared demo login, published here on purpose, so random visitors can't press the buttons before you do. It runs against PayPal's sandbox, so no real money moves.
+The demo is behind a shared login, so random visitors can't press the buttons before a judge does. The login is
+in Devpost's judges-only testing-instructions field, not in this file. It runs against PayPal's sandbox, so no
+real money moves.
 
 ## What it does
 
