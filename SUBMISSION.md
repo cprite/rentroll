@@ -8,6 +8,10 @@ RentRoll
 
 Small landlords get partial-payment plans based on what the tenant has actually paid through PayPal. The plans are written onto the real PayPal invoice and enforced on every payment, and the landlord gets a court-ready record.
 
+## Inspiration
+
+Before picking this idea we read 2,617 Reddit posts about payment pain, across 28 subreddits. About 30 of them were small landlords chasing rent by hand. One landlord on r/Landlord (November 2026) put it simply: "Top of each month is my wife and I asking each other if the tenant paid rent." We checked that against 546 hackathon demo videos and 252 GitHub repos built for this event, and found no entry that targets rent collection for small landlords specifically — the closest matches were general invoicing/collections tools and unrelated rental-deposit holds. That gap, and the fact that a partial-payment plan agreed over text has no enforcement and no paper trail, is what RentRoll is for.
+
 ## Description
 
 Lots of people with one to four rental units collect rent informally. The tenant sends money over Zelle, Venmo or PayPal, and every month the landlord scrolls through transactions to work out who paid what. When a tenant texts "can I pay 800 now and the rest on the 15th", the deal lives in a text thread. Nobody checks the next payment against it, and if it ends up in small claims court, the landlord is rebuilding the history from screenshots.
