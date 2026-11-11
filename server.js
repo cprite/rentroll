@@ -21,7 +21,7 @@
 import express from 'express';
 import { appendFileSync, readFileSync, existsSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { pp } from './lib/paypal.js';
@@ -29,6 +29,7 @@ import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
 import { courtPacketData, renderCourtPacketPdf } from './lib/court-packet.js';
 import { basicAuth } from './lib/auth.js';
+import { renderTenantPage } from './lib/tenant-page.js';
 import { invoiceFacts, getInvoice, createAndSendRentInvoice, applyTermsToInvoice, recordPaymentOnInvoice } from './lib/invoicing.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -196,6 +197,18 @@ function migrate(d) {
   // invoice_payment_id: the id PayPal gave this payment on the invoice (EXTR-... for record-payment).
   for (const [c, t] of [['invoice_payment_id', 'TEXT'], ['invoice_recorded_at', 'TEXT'], ['invoice_webhook_event_id', 'TEXT']])
     if (!d.prepare('PRAGMA table_info(payment)').all().some((x) => x.name === c)) d.exec(`ALTER TABLE payment ADD COLUMN ${c} ${t}`);
+  // Sprint 11: per-tenant access token for the tenant's own page (/t/:token). 32 random bytes, base64url (43 chars).
+  if (!d.prepare('PRAGMA table_info(tenant)').all().some((x) => x.name === 'access_token')) d.exec('ALTER TABLE tenant ADD COLUMN access_token TEXT');
+  d.exec('CREATE UNIQUE INDEX IF NOT EXISTS tenant_access_token ON tenant(access_token) WHERE access_token IS NOT NULL');
+  ensureTenantTokens(d);
+}
+const newAccessToken = () => randomBytes(32).toString('base64url');
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+// Back-fills a token for every tenant that has none (existing seeded DBs, and right after seed()).
+function ensureTenantTokens(d) {
+  const ids = d.prepare('SELECT id FROM tenant WHERE access_token IS NULL').all().map((r) => r.id);
+  for (const id of ids) d.prepare('UPDATE tenant SET access_token=? WHERE id=? AND access_token IS NULL').run(newAccessToken(), id);
+  return ids.length;
 }
 // node:sqlite has no transaction helper; BEGIN IMMEDIATE serialises writers (also across processes).
 function tx(d, fn) {
@@ -220,8 +233,8 @@ function seed(d) {
   if (d.prepare('SELECT COUNT(*) n FROM unit').get().n > 0) return 0;
   return tx(d, () => {
     for (const u of SEED_UNITS) {
-      const tenantId = Number(d.prepare('INSERT INTO tenant (name, email, phone) VALUES (?,?,?)')
-        .run(u.tenant.name, u.tenant.email, u.tenant.phone).lastInsertRowid);
+      const tenantId = Number(d.prepare('INSERT INTO tenant (name, email, phone, access_token) VALUES (?,?,?,?)')
+        .run(u.tenant.name, u.tenant.email, u.tenant.phone, newAccessToken()).lastInsertRowid);
       const unitId = Number(d.prepare('INSERT INTO unit (label, address, monthly_rent_cents, due_day, late_fee_rule_json, tenant_id) VALUES (?,?,?,?,?,?)')
         .run(u.label, u.address, u.rent, u.due_day ?? 1, JSON.stringify(LATE_FEE), tenantId).lastInsertRowid);
       const dueDate = `${SEED_PERIOD}-${String(u.due_day ?? 1).padStart(2, '0')}`;
@@ -277,7 +290,9 @@ const captureFields = (cap) => {
 // (developer.paypal.com/tools/sandbox/card-testing), no buyer login. Exactly the Sprint 0 flow.
 const SANDBOX_HOSTS = new Set(['api-m.sandbox.paypal.com', 'api.sandbox.paypal.com']);
 const isSandboxBase = (base) => { try { return SANDBOX_HOSTS.has(new URL(base).hostname.toLowerCase()); } catch { return false; } };
-async function payRentPeriodSandbox(d, rpId, amountCents) {
+// Sprint 11: `via` records which surface the payment came from ('tenant_link' = the tenant's own /t/:token page;
+// 'landlord_dashboard' = the landlord's simulate control). Same rules either way.
+async function payRentPeriodSandbox(d, rpId, amountCents, { via = 'landlord_dashboard' } = {}) {
   if (!isSandboxBase(process.env.PAYPAL_API_BASE || '')) throw new HttpError(503, 'sandbox card payments are disabled: PAYPAL_API_BASE is not a sandbox URL');
   if (!Number.isInteger(amountCents) || amountCents <= 0) throw new HttpError(400, 'amount must be a positive dollar amount, e.g. "800.00"');
 
@@ -350,9 +365,9 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
     const s = recompute(d, rp.id);
     const planStatus = settlePlan(d, planId);
     logEvent(d, { kind: 'payment', actor: 'tenant', rent_period_id: rp.id,
-      summary: `${rp.tenant_name} paid ${money(amountCents)} by card through PayPal${planId ? ` (plan #${planId}, installment ${idx} of ${planOf})` : ''} (capture ${cap.id}, ${cap.status}). Balance now ${money(s.balance_cents)}`,
+      summary: `${rp.tenant_name} paid ${money(amountCents)} by card through PayPal${planId ? ` (plan #${planId}, installment ${idx} of ${planOf})` : ''} (capture ${cap.id}, ${cap.status})${via === 'tenant_link' ? ' from their own tenant link' : ''}. Balance now ${money(s.balance_cents)}`,
       payload: { payment_id: payId, order_id: order.id, capture_id: cap.id, capture_status: cap.status, fee_cents: fee, net_cents: net, custom_id: customId,
-        plan_id: planId, plan_installment: planId ? idx : null } });
+        plan_id: planId, plan_installment: planId ? idx : null, via } });
     return { payment: d.prepare('SELECT * FROM payment WHERE id=?').get(payId), rent_period: s,
       plan: planId ? planOut(d, d.prepare('SELECT * FROM plan WHERE id=?').get(planId)) : null, plan_status: planStatus };
   });
@@ -483,7 +498,7 @@ async function handleTenantMessage(d, rpId, body, channel = 'sms') {
   const messageId = tx(d, () => {
     const id = Number(d.prepare('INSERT INTO message (tenant_id, rent_period_id, direction, channel, body) VALUES (?,?,?,?,?)')
       .run(rp.tenant_id, rp.id, 'in', channel, body.trim()).lastInsertRowid);
-    logEvent(d, { kind: 'message_in', actor: 'tenant', rent_period_id: rp.id, summary: `${rp.tenant_name} (${channel}): "${body.trim().slice(0, 160)}"`,
+    logEvent(d, { kind: 'message_in', actor: 'tenant', rent_period_id: rp.id, summary: `${rp.tenant_name} (${channel === 'app' ? 'own tenant link' : channel}): "${body.trim().slice(0, 160)}"`,
       payload: { message_id: id } });
     return id;
   });
@@ -892,6 +907,36 @@ async function ingestWebhookLog(d) {
   return out;
 }
 
+// ───────────────────────────── tenant page (Sprint 11) ─────────────────────────────
+// The token is the only credential for /t/:token. Lookup is by exact match on a 43-char base64url string; anything
+// else (malformed, unknown) is the same plain 404, so a response never hints at what a valid token looks like.
+function tenantByToken(d, token) {
+  if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null;
+  return d.prepare('SELECT id, name FROM tenant WHERE access_token = ?').get(token) || null;
+}
+// The tenant's own current rent period(s): one per unit they rent, latest month only. Never another tenant's.
+const tenantPeriods = (d, tenantId) => currentPeriods(d).filter((rp) => rp.tenant_id === tenantId);
+// Resolve which of THIS tenant's periods a POST is about. A rent_period_id that isn't theirs is a 404, not a 403.
+function tenantPeriodFor(d, tenant, rawId) {
+  const mine = tenantPeriods(d, tenant.id);
+  if (rawId == null || rawId === '') return mine.length === 1 ? mine[0] : mine.find((rp) => rp.amount_due_cents > rp.amount_paid_cents) || null;
+  return mine.find((rp) => rp.id === Number(rawId)) || null;
+}
+function tenantView(d, tenant, token, flash) {
+  return { token, tenant, flash, today: today(), periods: tenantPeriods(d, tenant.id).map((rp) => {
+    const approved = activePlanRow(d, rp.id);
+    const latest = d.prepare('SELECT * FROM plan WHERE rent_period_id=? ORDER BY id DESC LIMIT 1').get(rp.id);
+    // Show the enforced plan if there is one; else the newest plan unless it was superseded by an approval long ago.
+    const plan = planOut(d, approved || latest);
+    return { rp, snap: ledgerSnapshot(d, rp.id, today()), plan,
+      pending_cents: d.prepare("SELECT COALESCE(SUM(amount_cents),0) s FROM payment WHERE rent_period_id=? AND status='PENDING'").get(rp.id).s,
+      messages: d.prepare("SELECT body, channel, received_at FROM message WHERE rent_period_id=? AND tenant_id=? AND direction='in' ORDER BY id").all(rp.id, tenant.id),
+      payments: d.prepare("SELECT amount_cents, status, paid_at, created_at, plan_installment, paypal_capture_id, webhook_event_id, invoice_webhook_event_id FROM payment WHERE rent_period_id=? AND status<>'FAILED' ORDER BY id").all(rp.id) };
+  }) };
+}
+// Cheap guard on the LLM-backed route: at most TENANT_MSG_LIMIT messages per tenant from their link per 10 minutes.
+const TENANT_MSG_LIMIT = Number(process.env.RENTROLL_TENANT_MSG_LIMIT) || 5;
+
 // ───────────────────────────── dashboard ─────────────────────────────
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 864e5);
@@ -953,6 +998,7 @@ h2{font-size:17px;margin:30px 0 10px}
 .feed time{width:130px;flex:none;color:var(--muted);font-size:12.5px;padding-top:1px}
 .who{flex:none;width:64px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);padding-top:2px}.who.paypal{color:var(--brand)}
 footer{color:var(--muted);font-size:12.5px;padding:28px 0 40px}
+.tlink{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}button.copy{padding:3px 8px;font-size:12px}
 form.msg input{width:250px}button.ghost{background:#fff;color:var(--brand);border:1px solid #c9d8ff}
 tr.planrow td{background:#fbfcff;padding:0 16px 16px}
 .plan{border:1px solid #c9d8ff;border-left:4px solid var(--brand);border-radius:10px;background:#fff;padding:12px 16px}
@@ -1062,7 +1108,11 @@ function renderDashboard(d, flash) {
         <a class="packet small" href="/api/rent-periods/${rp.id}/court-packet.pdf" title="Payment-history PDF from the ledger and PayPal records (not legal advice)">Download court packet (PDF)</a>
         ${rp.paypal_invoice_id ? `<div class="small inv" title="The real PayPal invoice for this month (read back from PayPal after every change)">PayPal invoice <a href="${esc(rp.payer_view_url || '#')}" rel="noopener" target="_blank">${esc(rp.paypal_invoice_number)}</a> · <b>${esc(rp.paypal_invoice_status)}</b>
           · ${rp.paypal_invoice_min_due_cents != null ? `partial OK, min ${money(rp.paypal_invoice_min_due_cents)}` : 'full amount'} · due ${esc(rp.paypal_invoice_due_date || '')}${rp.paypal_invoice_paid_cents ? ` · ${money(rp.paypal_invoice_paid_cents)} paid on invoice` : ''}</div>` : `<div class="small inv">No PayPal invoice yet</div>`}</td>
-      <td>${esc(rp.tenant_name)}<div class="small">${esc(rp.tenant_email)}</div></td>
+      <td>${esc(rp.tenant_name)}<div class="small">${esc(rp.tenant_email)}</div>${(() => {
+        const tok = d.prepare('SELECT access_token FROM tenant WHERE id=?').get(rp.tenant_id)?.access_token;
+        return tok ? `<div class="tlink"><a class="small" href="/t/${esc(tok)}" target="_blank" rel="noopener noreferrer" title="The tenant's own page: their balance, plan, messages and payments. No login; the link itself is the key, so send it only to this tenant">Tenant's page ↗</a>
+          <button type="button" class="ghost copy" data-path="/t/${esc(tok)}">Copy tenant link</button></div>` : '';
+      })()}</td>
       <td class="num">${money(rp.amount_due_cents)}<div class="small">due ${fmtDate(rp.due_date)}</div></td>
       <td class="num">${money(rp.amount_paid_cents)}<div class="bar"><i style="width:${pct}%"></i></div>${bal > 0 && rp.amount_paid_cents > 0 ? `<div class="small">${money(bal)} left</div>` : ''}</td>
       <td><span class="pill ${rp.status}">${rp.status.replace('_', ' ')}</span></td>
@@ -1092,6 +1142,8 @@ function renderDashboard(d, flash) {
     <span class="small">Reads the live ledger: who owes what, days overdue, late-fee grace, and reminders already sent (max one per ${RATE_LIMIT_HOURS()} h per unchanged balance). Drafts are logged; no SMS/email integration yet.</span></div>
   <table><thead><tr><th>Unit</th><th>Tenant</th><th class="num">Due</th><th class="num">Paid</th><th>Status</th><th>Next action</th></tr></thead><tbody>${trs}</tbody></table>
   <h2>Ledger</h2><ul class="feed">${feed || '<li>No activity yet.</li>'}</ul>
+  <script>document.addEventListener('click',async(e)=>{const b=e.target.closest('button.copy');if(!b)return;const u=location.origin+b.dataset.path;
+    try{await navigator.clipboard.writeText(u);b.textContent='Copied ✓';setTimeout(()=>{b.textContent='Copy tenant link'},1500)}catch{window.prompt('Copy this tenant link',u)}});</script>
   <footer>Each month's rent is a real PayPal invoice; approving a plan rewrites that invoice's minimum amount due and due date. "Tenant pays" charges PayPal's sandbox test card through the Orders API and RentRoll records that capture on the invoice (record-payment). Every payment and PayPal webhook is written to an append-only ledger. No real money moves.</footer>
 </main></body></html>`;
 }
@@ -1273,6 +1325,60 @@ function buildApp(d) {
   });
   app.get('/api/reminders', (_req, res) => res.json(d.prepare("SELECT id, at, rent_period_id, summary, payload_json FROM event_log WHERE kind='reminder_sent' ORDER BY id").all()
     .map((r) => ({ ...r, payload_json: undefined, payload: JSON.parse(r.payload_json) }))));
+
+  // ── Sprint 11: the tenant's own page. No Basic Auth (exempt in lib/auth.js); the token in the URL is the key. ──
+  const notFound = (res) => res.status(404).type('text/plain').send('Not found.\n');
+  // Token check runs BEFORE any body parsing, so a bad token is always the same 404 whatever the request carries.
+  const tenantAuth = (req, res, next) => {
+    res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Robots-Tag': 'noindex, nofollow', 'X-Frame-Options': 'DENY' });
+    req.tenant = tenantByToken(d, req.params.token);
+    return req.tenant ? next() : notFound(res);
+  };
+  const tenantRoute = (handler) => async (req, res) => {
+    const tenant = req.tenant;
+    const wantsJson = req.is('application/json') || req.query.format === 'json';
+    const back = (ok, msg, anchor = '') => res.redirect(303, `/t/${req.params.token}?${ok ? 'ok' : 'err'}=${encodeURIComponent(msg)}${anchor}`);
+    try { await handler(req, res, { tenant, wantsJson, back }); }
+    catch (e) {
+      if (e.status === 404) return notFound(res);
+      if (!e.status) console.error('[tenant] failed:', e.message);
+      const msg = e.status ? e.message : 'Something went wrong on our side. Nothing was charged; please try again.';
+      return wantsJson ? res.status(e.status || 500).json({ ok: false, error: msg }) : back(false, msg);
+    }
+  };
+  app.get('/t/:token', tenantAuth, tenantRoute(async (req, res, { tenant }) => {
+    const flash = req.query.ok ? { ok: true, msg: String(req.query.ok).slice(0, 400) } : req.query.err ? { ok: false, msg: String(req.query.err).slice(0, 400) } : null;
+    res.type('html').send(renderTenantPage(tenantView(d, tenant, req.params.token, flash)));
+  }));
+  const both = [express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' })];
+  // The tenant's own words -> the SAME handleTenantMessage() the landlord route uses (ledger-grounded AI plan),
+  // scoped to the tenant's own rent period. channel 'app' = typed on their tenant page.
+  app.post('/t/:token/messages', tenantAuth, ...both, tenantRoute(async (req, res, { tenant, wantsJson, back }) => {
+    const rp = tenantPeriodFor(d, tenant, req.body?.rent_period_id);
+    if (!rp) throw new HttpError(404, 'not found');
+    const recent = d.prepare("SELECT COUNT(*) n FROM message WHERE tenant_id=? AND channel='app' AND received_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 minutes')").get(tenant.id).n;
+    if (recent >= TENANT_MSG_LIMIT) throw new HttpError(429, `You've sent ${recent} messages in the last 10 minutes. Please wait a few minutes before sending another.`);
+    const r = await handleTenantMessage(d, rp.id, req.body?.body, 'app');
+    if (wantsJson) { const { http, ...out } = r; return res.status(http).json({ ok: http === 200, ...out }); }
+    if (!r.plan) return back(false, r.error);
+    back(r.plan.status === 'proposed', {
+      proposed: 'Sent. The AI drafted a payment plan from your real balance; your landlord will approve or decline it.',
+      needs_review: 'Sent. RentRoll couldn\'t make a plan that adds up from that message, so your landlord will review it.',
+      parse_failed: 'Sent. RentRoll couldn\'t turn that message into a plan, so your landlord will review it.' }[r.plan.status], '#plan');
+  }));
+  // The tenant pays -> the SAME payRentPeriodSandbox() rules (approved plan: exact next installment only).
+  app.post('/t/:token/pay-sandbox', tenantAuth, ...both, tenantRoute(async (req, res, { tenant, wantsJson, back }) => {
+    const rp = tenantPeriodFor(d, tenant, req.body?.rent_period_id);
+    if (!rp) throw new HttpError(404, 'not found');
+    const b = req.body || {};
+    const cents = b.amount_cents != null ? Number(b.amount_cents) : parseMoney(b.amount);
+    if (cents == null) throw new HttpError(400, 'Enter a dollar amount like 800.00');
+    const r = await payRentPeriodSandbox(d, rp.id, cents, { via: 'tenant_link' });
+    if (wantsJson) return res.json({ ok: true, payment: { id: r.payment.id, status: r.payment.status, amount_cents: r.payment.amount_cents,
+      paypal_order_id: r.payment.paypal_order_id, paypal_capture_id: r.payment.paypal_capture_id, plan_installment: r.payment.plan_installment },
+      rent_period: r.rent_period, plan_status: r.plan_status, invoice_recorded: !!r.invoice?.ok });
+    back(true, `Thank you. ${money(r.payment.amount_cents)} paid through PayPal (ref ${r.payment.paypal_capture_id}). ${r.rent_period.balance_cents > 0 ? `Still owed: ${money(r.rent_period.balance_cents)}.` : 'You are paid in full.'}`, '#balance');
+  }));
 
   // Body-parser and other uncaught errors: plain JSON, never Express's HTML page with a stack trace.
   app.use((err, _req, res, _next) => {
