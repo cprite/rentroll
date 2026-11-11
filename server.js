@@ -2,7 +2,9 @@
 // Sprint 2: tenant message -> AI payment plan grounded in the live ledger, see lib/plan-ai.js;
 // Sprint 3: landlord approval turns the plan into a server-enforced payment constraint, see approvePlan();
 // Sprint 4: reminder escalation from real ledger state, POST /api/reminders/run, see runReminders() + lib/reminders.js;
-// Sprint 6: court packet, GET /api/rent-periods/:id/court-packet.pdf (and .json), see lib/court-packet.js).
+// Sprint 6: court packet, GET /api/rent-periods/:id/court-packet.pdf (and .json), see lib/court-packet.js);
+// Sprint 10: PayPal Invoicing is the core: one real invoice per rent period, plan approval rewrites the invoice's
+// configuration.partial_payment + due date, payments are recorded on the invoice, INVOICING.* webhooks reconcile.
 //
 // One file on purpose for tonight: schema + seed + domain logic + dashboard + PayPal endpoints.
 //   node server.js                 start (auto-creates data/rentroll.db, seeds demo data if empty,
@@ -10,12 +12,12 @@
 //   node server.js --seed [--reset] seed demo data and exit (--reset wipes the demo DB and rotates the
 //                                  webhook log aside; stop rentroll.service first, start it again after)
 //   node server.js --ingest-webhook-log  replay logged deliveries through the handler and exit (idempotent)
+//   node server.js --ensure-invoices     create + send a PayPal invoice for every rent period that has none, exit
+//   node server.js --open-month 2026-12  open next month's rent periods (one per unit) + their PayPal invoices, exit
 //
-// INVOICING (blocked: sandbox app has no Invoicing scope, 403 NOT_AUTHORIZED, see SPRINT0.md):
-//   the ready-to-run plumbing is scripts/sprint0-invoice.mjs (create+send, partial payment via
-//   configuration.partial_payment, PUT onto a sent invoice). Once the scope is granted, wire it in by
-//   setting rent_period.paypal_invoice_id / paypal_invoice_status / payer_view_url and adding an
-//   INVOICING.INVOICE.PAID case in handleWebhook() below (GET the invoice, read status + payments).
+// INVOICING (Sprint 10, see lib/invoicing.js and SPRINT10.md). RENTROLL_INVOICING=0 turns every Invoicing call
+// off (offline tests). The tenant's card charge still runs through Orders (no logged-in buyer needed); the
+// capture is then recorded on the invoice with record-payment, so the invoice itself carries the payment.
 import express from 'express';
 import { appendFileSync, readFileSync, existsSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +29,7 @@ import { ledgerSnapshot, proposePlan } from './lib/plan-ai.js';
 import { reminderState, draftReminder, RATE_LIMIT_HOURS } from './lib/reminders.js';
 import { courtPacketData, renderCourtPacketPdf } from './lib/court-packet.js';
 import { basicAuth } from './lib/auth.js';
+import { invoiceFacts, getInvoice, createAndSendRentInvoice, applyTermsToInvoice, recordPaymentOnInvoice } from './lib/invoicing.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Raw delivery log, kept for audit (override in tests so fake events never land in the real log).
@@ -41,6 +44,7 @@ const WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '8X653932CG029174U';
 // 'record': debugging only. Verify and store the result, but still process unverified deliveries.
 const WEBHOOK_VERIFY = process.env.WEBHOOK_VERIFY === 'record' ? 'record' : 'enforce';
 const today = () => process.env.RENTROLL_TODAY || new Date().toISOString().slice(0, 10);
+const INVOICING_ON = process.env.RENTROLL_INVOICING !== '0';
 
 // ───────────────────────────── data model ─────────────────────────────
 // All money is integer cents; timestamps ISO-8601 UTC.
@@ -183,6 +187,15 @@ function migrate(d) {
   if (!payCols.includes('plan_installment')) d.exec('ALTER TABLE payment ADD COLUMN plan_installment INTEGER');
   // At most one approved (= enforced) plan per rent period, guaranteed by the DB, not just the handler.
   d.exec("CREATE UNIQUE INDEX IF NOT EXISTS plan_one_approved ON plan(rent_period_id) WHERE status = 'approved'");
+  // Sprint 10: mirror of the real PayPal invoice (PayPal stays the source; these are read back after every call).
+  const rpCols = d.prepare('PRAGMA table_info(rent_period)').all().map((c) => c.name);
+  for (const [c, t] of [['paypal_invoice_number', 'TEXT'], ['paypal_invoice_paid_cents', 'INTEGER'], ['paypal_invoice_due_cents', 'INTEGER'],
+    ['paypal_invoice_min_due_cents', 'INTEGER'], ['paypal_invoice_due_date', 'TEXT'], ['paypal_invoice_synced_at', 'TEXT']])
+    if (!rpCols.includes(c)) d.exec(`ALTER TABLE rent_period ADD COLUMN ${c} ${t}`);
+  d.exec('CREATE UNIQUE INDEX IF NOT EXISTS rent_period_invoice ON rent_period(paypal_invoice_id) WHERE paypal_invoice_id IS NOT NULL');
+  // invoice_payment_id: the id PayPal gave this payment on the invoice (EXTR-... for record-payment).
+  for (const [c, t] of [['invoice_payment_id', 'TEXT'], ['invoice_recorded_at', 'TEXT'], ['invoice_webhook_event_id', 'TEXT']])
+    if (!d.prepare('PRAGMA table_info(payment)').all().some((x) => x.name === c)) d.exec(`ALTER TABLE payment ADD COLUMN ${c} ${t}`);
 }
 // node:sqlite has no transaction helper; BEGIN IMMEDIATE serialises writers (also across processes).
 function tx(d, fn) {
@@ -319,7 +332,7 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
   // 3. Record the outcome.
   const order = r.body || {};
   const cap = order.purchase_units?.[0]?.payments?.captures?.[0];
-  return tx(d, () => {
+  const out = tx(d, () => {
     if (r.status >= 300 || !cap) {
       const err = `${r.status} ${order.name || ''} ${order.details?.[0]?.issue || order.message || ''}`.trim();
       d.prepare("UPDATE payment SET status='FAILED', error=?, paypal_debug_id=? WHERE id=? AND status='PENDING'").run(err, r.debug_id, payId);
@@ -343,6 +356,13 @@ async function payRentPeriodSandbox(d, rpId, amountCents) {
     return { payment: d.prepare('SELECT * FROM payment WHERE id=?').get(payId), rent_period: s,
       plan: planId ? planOut(d, d.prepare('SELECT * FROM plan WHERE id=?').get(planId)) : null, plan_status: planStatus };
   });
+  // Sprint 10: write the captured money onto the real PayPal invoice (record-payment), then move the invoice's
+  // minimum amount due on to the next installment. A failure here is logged and returned, never hidden.
+  if (out.payment.status === 'COMPLETED') {
+    out.invoice = await recordCaptureOnInvoice(d, payId);
+    out.payment = d.prepare('SELECT * FROM payment WHERE id=?').get(payId);
+  }
+  return out;
 }
 
 // ───────────────────────────── tenant message → AI plan (Sprint 2) ─────────────────────────────
@@ -501,6 +521,206 @@ async function handleTenantMessage(d, rpId, body, channel = 'sms') {
     tenant_stated: r.tenant_stated ?? null, adjusted: r.adjusted ?? null };
 }
 
+// ───────────────────────────── PayPal Invoicing (Sprint 10) ─────────────────────────────
+// The rent period's PayPal invoice is the real, tenant-facing bill. RentRoll writes to it (create/send, plan terms,
+// record-payment) and reads it back after every write; the rent_period.paypal_invoice_* columns only mirror
+// what the last GET returned.
+function saveInvoiceMirror(d, rpId, f) {
+  d.prepare(`UPDATE rent_period SET paypal_invoice_id=?, paypal_invoice_number=?, paypal_invoice_status=?, payer_view_url=?,
+      paypal_invoice_paid_cents=?, paypal_invoice_due_cents=?, paypal_invoice_min_due_cents=?, paypal_invoice_due_date=?, paypal_invoice_synced_at=? WHERE id=?`)
+    .run(f.id, f.number, f.status, f.payer_view_url, f.paid_cents, f.due_cents, f.allow_partial_payment ? f.minimum_amount_due_cents : null,
+      f.due_date, new Date().toISOString(), rpId);
+}
+const invTerms = (f) => f && { status: f.status, allow_partial_payment: f.allow_partial_payment, minimum_amount_due_cents: f.minimum_amount_due_cents,
+  due_date: f.due_date, paid_cents: f.paid_cents, due_cents: f.due_cents };
+const minTxt = (f) => (f.allow_partial_payment ? `minimum ${money(f.minimum_amount_due_cents)}` : 'full amount only (partial payment off)');
+
+// One real invoice per rent period: create it as "pay in full", send it, store id + number.
+const invoiceInFlight = new Set();
+async function ensureInvoice(d, rpId) {
+  const rp = getPeriod(d, rpId);
+  if (!rp || rp.paypal_invoice_id || invoiceInFlight.has(rpId)) return null;
+  invoiceInFlight.add(rpId);
+  try {
+    const number = `RR-${rp.period}-U${rp.unit_id}-RP${rp.id}-${Date.now().toString(36).toUpperCase()}`;
+    const r = await createAndSendRentInvoice(rp, { invoiceNumber: number });
+    const f = invoiceFacts(r.invoice);
+    tx(d, () => {
+      saveInvoiceMirror(d, rpId, f);
+      logEvent(d, { kind: 'invoice_sent', actor: 'landlord', rent_period_id: rpId,
+        summary: `PayPal invoice ${f.number} (${f.id}) created and sent to ${rp.tenant_name} for ${money(f.total_cents)}, due ${f.due_date}. PayPal status ${f.status}, ${minTxt(f)}`,
+        payload: { invoice_id: f.id, invoice_number: f.number, ...invTerms(f), total_cents: f.total_cents, payer_view_url: f.payer_view_url,
+          debug_ids: { create: r.create_debug_id, send: r.send_debug_id } } });
+    });
+    return f;
+  } finally { invoiceInFlight.delete(rpId); }
+}
+async function ensureInvoices(d) {
+  const out = [];
+  for (const { id } of d.prepare('SELECT id FROM rent_period WHERE paypal_invoice_id IS NULL ORDER BY id').all()) {
+    try { const f = await ensureInvoice(d, id); if (f) out.push({ rent_period_id: id, invoice_id: f.id, invoice_number: f.number, status: f.status }); }
+    catch (e) { console.error(`[invoice] rent_period ${id}: ${e.message}`); out.push({ rent_period_id: id, error: e.message }); }
+  }
+  return out;
+}
+
+// Make the real invoice say what the plan says. With an approved plan and an unpaid installment:
+// partial payment ON, minimum_amount_due = that installment, due date = its due date, schedule in the note.
+// Without a plan (cancelled / none): partial payment OFF, original due date. PayPal enforces only the minimum;
+// the full schedule lives in RentRoll's plan table (PayPal has no installment-schedule field).
+async function syncInvoiceTerms(d, rpId, { reason }) {
+  if (!INVOICING_ON) return { ok: false, skipped: 'invoicing disabled (RENTROLL_INVOICING=0)' };
+  const rp = getPeriod(d, rpId);
+  if (!rp?.paypal_invoice_id) return { ok: false, skipped: 'this rent period has no PayPal invoice' };
+  if (['PAID', 'MARKED_AS_PAID', 'CANCELLED', 'REFUNDED'].includes(rp.paypal_invoice_status)) return { ok: true, skipped: `invoice is ${rp.paypal_invoice_status}` };
+  const ap = activePlanRow(d, rpId);
+  const sch = ap ? planSchedule(d, ap) : null;
+  const nx = sch?.next_installment;
+  if (ap && !nx) return { ok: true, skipped: `plan #${ap.id} has no unpaid installment` };
+  const base = `${monthName(rp.period)} rent, ${rp.unit_label}, ${rp.unit_address || ''}`.trim();
+  const terms = nx
+    ? { allowPartial: true, minimumCents: nx.amount_cents, dueDate: nx.due_date,
+      note: `${base}. Payment plan #${ap.id} approved by the landlord ${ap.approved_at.slice(0, 10)}: ` +
+        sch.installments.map((x) => `${x.n}) ${money(x.amount_cents)} by ${x.due_date}${x.state === 'PAID' ? ' (paid)' : ''}`).join(', ') +
+        `. Next payment due: ${money(nx.amount_cents)} by ${nx.due_date}.` }
+    : { allowPartial: false, dueDate: rp.due_date, note: `${base}. No payment plan in force.` };
+  let r;
+  try { r = await applyTermsToInvoice(rp.paypal_invoice_id, terms); }
+  catch (e) {
+    tx(d, () => logEvent(d, { kind: 'invoice_update_failed', actor: 'system', rent_period_id: rpId,
+      summary: `Could not update PayPal invoice ${rp.paypal_invoice_number} (${reason}): ${e.message}. RentRoll's own enforcement still applies`,
+      payload: { invoice_id: rp.paypal_invoice_id, reason, wanted: terms, error: e.message, debug_id: e.debug_id ?? null } }));
+    return { ok: false, error: e.message };
+  }
+  const fb = invoiceFacts(r.before), f = invoiceFacts(r.after);
+  const applied = f.allow_partial_payment === terms.allowPartial && (!terms.allowPartial || f.minimum_amount_due_cents === terms.minimumCents) && f.due_date === terms.dueDate;
+  tx(d, () => {
+    saveInvoiceMirror(d, rpId, f);
+    logEvent(d, { kind: 'invoice_updated', actor: 'landlord', rent_period_id: rpId,
+      summary: `PayPal invoice ${f.number} updated (${reason}): ${minTxt(fb)} -> ${minTxt(f)}, due ${fb.due_date} -> ${f.due_date}. Read back from PayPal: status ${f.status}${applied ? '' : ' (WARNING: PayPal did not store what RentRoll sent)'}`,
+      payload: { invoice_id: f.id, invoice_number: f.number, reason, plan_id: ap?.id ?? null, before: invTerms(fb), after: invTerms(f), applied, put_debug_id: r.put_debug_id } });
+  });
+  return { ok: applied, invoice_id: f.id, invoice_number: f.number, before: invTerms(fb), after: invTerms(f) };
+}
+
+// Card money moves through Orders (no buyer login needed); this writes that capture onto the real invoice with
+// record-payment. Idempotent: skips if the payment already has an invoice payment id, or if the invoice already
+// carries a transaction whose note names this capture (e.g. the API path and the capture webhook raced).
+const recordingNow = new Set();
+async function recordCaptureOnInvoice(d, payId) {
+  if (!INVOICING_ON) return { ok: false, skipped: 'invoicing disabled (RENTROLL_INVOICING=0)' };
+  const pay = d.prepare('SELECT * FROM payment WHERE id=?').get(payId);
+  if (!pay || pay.status !== 'COMPLETED' || !pay.paypal_capture_id) return { ok: false, skipped: 'payment is not a completed capture' };
+  if (pay.invoice_payment_id) return { ok: true, skipped: 'already recorded', invoice_payment_id: pay.invoice_payment_id };
+  const rp = getPeriod(d, pay.rent_period_id);
+  if (!rp?.paypal_invoice_id) return { ok: false, skipped: 'this rent period has no PayPal invoice' };
+  if (recordingNow.has(payId)) return { ok: true, skipped: 'recording in progress' };
+  recordingNow.add(payId);
+  try {
+    const cur = invoiceFacts(await getInvoice(rp.paypal_invoice_id));
+    let extr = cur.transactions.find((t) => (t.note || '').includes(pay.paypal_capture_id))?.payment_id ?? null;
+    let debugId = null;
+    if (!extr) {
+      const r = await recordPaymentOnInvoice(rp.paypal_invoice_id, { amountCents: pay.amount_cents,
+        paymentDate: (pay.paid_at || new Date().toISOString()).slice(0, 10),
+        note: `RentRoll payment #${pay.id}: card charged through the PayPal Orders API, order ${pay.paypal_order_id}, capture ${pay.paypal_capture_id}` +
+          `${pay.plan_id ? `, plan #${pay.plan_id} installment ${pay.plan_installment}` : ''}. Recorded on this invoice by RentRoll (record-payment).` });
+      extr = r.invoice_payment_id; debugId = r.debug_id;
+    }
+    const f = invoiceFacts(await getInvoice(rp.paypal_invoice_id));
+    tx(d, () => {
+      d.prepare("UPDATE payment SET invoice_payment_id=?, invoice_recorded_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND invoice_payment_id IS NULL").run(extr, payId);
+      saveInvoiceMirror(d, rp.id, f);
+      logEvent(d, { kind: 'invoice_payment_recorded', actor: 'system', rent_period_id: rp.id,
+        summary: `Recorded ${money(pay.amount_cents)} (capture ${pay.paypal_capture_id}) on PayPal invoice ${f.number} as payment ${extr}. Read back from PayPal: ${f.status}, ${money(f.paid_cents)} paid, ${money(f.due_cents)} due`,
+        payload: { payment_id: payId, invoice_id: f.id, invoice_number: f.number, invoice_payment_id: extr, capture_id: pay.paypal_capture_id,
+          after: invTerms(f), debug_id: debugId, already_on_invoice: !debugId } });
+    });
+    const terms = activePlanRow(d, rp.id) ? await syncInvoiceTerms(d, rp.id, { reason: `installment ${pay.plan_installment} paid, next installment` }) : null;
+    return { ok: true, invoice_payment_id: extr, invoice: invTerms(f), invoice_terms: terms };
+  } catch (e) {
+    tx(d, () => logEvent(d, { kind: 'invoice_update_failed', actor: 'system', rent_period_id: rp.id,
+      summary: `Could not record capture ${pay.paypal_capture_id} on PayPal invoice ${rp.paypal_invoice_number}: ${e.message}`,
+      payload: { payment_id: payId, invoice_id: rp.paypal_invoice_id, error: e.message, debug_id: e.debug_id ?? null } }));
+    return { ok: false, error: e.message };
+  } finally { recordingNow.delete(payId); }
+}
+
+// INVOICING.INVOICE.* webhook: never trust the payload's numbers. GET the invoice, then reconcile every
+// transaction PayPal holds against RentRoll's payment rows. A transaction RentRoll did not record itself
+// (e.g. the tenant paid on PayPal's hosted invoice page) becomes a new paypal_invoice payment.
+async function handleInvoiceEvent(d, event, { verification, via }) {
+  const claimed = event.resource?.invoice || event.resource || {};
+  const invId = claimed.id;
+  const meta = { event_id: event.id, event_type: event.event_type, verification, via, resource_id: invId, create_time: event.create_time ?? null,
+    payload_claimed: { status: claimed.status ?? null, paid_amount: claimed.payments?.paid_amount ?? null } };
+  const rpRow = invId ? d.prepare('SELECT id FROM rent_period WHERE paypal_invoice_id=?').get(invId) : null;
+  if (!rpRow) {
+    logEvent(d, { kind: 'webhook_received', actor: 'paypal', summary: `PayPal ${event.event_type} for invoice ${invId || '?'}, which is not a RentRoll rent invoice`, payload: meta, paypal_event_id: event.id });
+    return { result: 'unmatched_invoice', event_id: event.id, invoice_id: invId };
+  }
+  // A failed GET throws before anything is logged, so the 500 makes PayPal retry the delivery.
+  const f = invoiceFacts(await getInvoice(invId));
+  const out = tx(d, () => {
+    if (d.prepare('SELECT id FROM event_log WHERE paypal_event_id=?').get(event.id)) return { result: 'duplicate', event_id: event.id };
+    const rp = getPeriod(d, rpRow.id);
+    const added = [], matched = [];
+    for (const t of f.transactions) {
+      let pay = d.prepare('SELECT * FROM payment WHERE rent_period_id=? AND invoice_payment_id=?').get(rp.id, t.payment_id);
+      if (!pay) { // our own record-payment whose API response hasn't been stored yet: the note names the capture
+        const cap = /capture ([A-Z0-9]{10,})/.exec(t.note || '')?.[1];
+        pay = cap ? d.prepare('SELECT * FROM payment WHERE paypal_capture_id=?').get(cap) : null;
+        if (pay) d.prepare('UPDATE payment SET invoice_payment_id=COALESCE(invoice_payment_id, ?) WHERE id=?').run(t.payment_id, pay.id);
+      }
+      if (pay) {
+        d.prepare('UPDATE payment SET invoice_webhook_event_id=COALESCE(invoice_webhook_event_id, ?) WHERE id=?').run(event.id, pay.id);
+        matched.push({ payment_id: pay.id, invoice_payment_id: t.payment_id });
+        continue;
+      }
+      // Paid on PayPal's side without going through RentRoll: record what PayPal says, link to the plan only
+      // if it is exactly the next installment.
+      const ap = activePlanRow(d, rp.id);
+      const nx = ap ? planSchedule(d, ap).next_installment : null;
+      const link = nx && t.amount_cents === nx.amount_cents;
+      const idx = d.prepare("SELECT COUNT(*) n FROM payment WHERE rent_period_id=? AND status IN ('COMPLETED','PENDING')").get(rp.id).n + 1;
+      const id = Number(d.prepare(`INSERT INTO payment (rent_period_id, installment_index, source, status, amount_cents, custom_id, paid_at,
+          plan_id, plan_installment, invoice_payment_id, invoice_webhook_event_id, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(rp.id, link ? nx.n : idx, 'paypal_invoice', 'COMPLETED', t.amount_cents, `RRINV:${invId}:${t.payment_id}`, t.payment_date || event.create_time || null,
+          link ? ap.id : null, link ? nx.n : null, t.payment_id, event.id,
+          nx && !link ? `amount ${money(t.amount_cents)} is not plan #${ap.id}'s next installment (${money(nx.amount_cents)})` : null).lastInsertRowid);
+      if (link) settlePlan(d, ap.id);
+      added.push({ payment_id: id, invoice_payment_id: t.payment_id, type: t.type, method: t.method, amount_cents: t.amount_cents, plan_id: link ? ap.id : null });
+    }
+    const s = recompute(d, rp.id);
+    saveInvoiceMirror(d, rp.id, f);
+    const matches = f.paid_cents === s.paid_cents;
+    logEvent(d, { kind: 'webhook_received', actor: 'paypal', rent_period_id: rp.id,
+      summary: `PayPal ${event.event_type} for invoice ${f.number}. Re-read from PayPal: ${f.status}, ${money(f.paid_cents)} paid, ${money(f.due_cents)} due, ${minTxt(f)}, due ${f.due_date}` +
+        `${added.length ? `. ${added.length} payment(s) made on PayPal's side added to the ledger` : ''}. ${matches ? 'Matches' : `MISMATCH with`} RentRoll's ledger (${money(s.paid_cents)} paid)`,
+      payload: { ...meta, invoice_id: f.id, invoice_number: f.number, invoice: invTerms(f), local_paid_cents: s.paid_cents, matches_ledger: matches, matched, added },
+      paypal_event_id: event.id });
+    return { result: 'invoice_reconciled', invoice_id: f.id, invoice_status: f.status, invoice_paid_cents: f.paid_cents, local_paid_cents: s.paid_cents,
+      matches_ledger: matches, added: added.length, matched: matched.length, event_id: event.id, event_type: event.event_type, verification, via };
+  });
+  if (out.added && activePlanRow(d, rpRow.id)) out.invoice_terms = await syncInvoiceTerms(d, rpRow.id, { reason: 'payment made on the PayPal invoice' });
+  return out;
+}
+
+// Open a new month: one rent_period per unit (same rent + due day) and its PayPal invoice.
+async function openMonth(d, period) {
+  if (!/^\d{4}-\d{2}$/.test(period)) throw new HttpError(400, 'period must be YYYY-MM');
+  const created = tx(d, () => d.prepare('SELECT * FROM unit ORDER BY id').all().flatMap((u) => {
+    if (d.prepare('SELECT 1 FROM rent_period WHERE unit_id=? AND period=?').get(u.id, period)) return [];
+    const due = `${period}-${String(u.due_day).padStart(2, '0')}`;
+    const id = Number(d.prepare('INSERT INTO rent_period (unit_id, tenant_id, period, due_date, amount_due_cents) VALUES (?,?,?,?,?)')
+      .run(u.id, u.tenant_id, period, due, u.monthly_rent_cents).lastInsertRowid);
+    logEvent(d, { kind: 'seed', actor: 'system', rent_period_id: id, summary: `${monthName(period)} rent opened for ${u.label}: ${money(u.monthly_rent_cents)} due ${due}`,
+      payload: { unit_id: u.id, tenant_id: u.tenant_id } });
+    return [id];
+  }));
+  return { created, invoices: INVOICING_ON ? await ensureInvoices(d) : [] };
+}
+
 // ───────────────────────────── reminder escalation (Sprint 4) ─────────────────────────────
 // Manually / dashboard-triggered check (no fake background scheduler). Every decision is recomputed from the
 // payments table + event_log at run time; see lib/reminders.js.
@@ -580,10 +800,18 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
   const verification = await verifySignature(headers, rawBody ?? JSON.stringify(event));
   if (WEBHOOK_VERIFY === 'enforce' && verification !== 'SUCCESS') return { result: 'rejected_signature', verification };
 
+  if (String(event.event_type).startsWith('INVOICING.INVOICE.')) {
+    try { return await handleInvoiceEvent(d, event, { verification, via }); }
+    catch (e) {
+      if (/UNIQUE constraint failed: event_log\.paypal_event_id|duplicate paypal_event_id/.test(e.message)) return { result: 'duplicate', event_id: event.id };
+      throw e;
+    }
+  }
   const res = event.resource || {};
   const base = { event_id: event.id, event_type: event.event_type, verification, via };
+  let out;
   try {
-    return tx(d, () => {
+    out = tx(d, () => {
       if (seen()) return { result: 'duplicate', event_id: event.id };
       const meta = { ...base, resource_id: res.id, custom_id: res.custom_id, amount: res.amount, create_time: event.create_time ?? null };
 
@@ -629,7 +857,7 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
         return { result: completed ? 'payment_confirmed' : 'payment_denied', payment_id: pay.id, ...s, ...base };
       }
 
-      // Recorded in the ledger; no state change yet (INVOICING.* lands once the scope is granted).
+      // Other event types (CHECKOUT.ORDER.APPROVED, ...): recorded in the ledger, no state change.
       logEvent(d, { kind: 'webhook_received', actor: 'paypal', summary: `PayPal event ${event.event_type} received (${event.summary || 'no summary'})`,
         payload: meta, paypal_event_id: event.id });
       return { result: 'logged', ...base };
@@ -638,6 +866,10 @@ async function handleWebhook(d, event, { headers = {}, rawBody, via = 'live' } =
     if (/UNIQUE constraint failed: event_log\.paypal_event_id|duplicate paypal_event_id/.test(e.message)) return { result: 'duplicate', event_id: event.id };
     throw e;
   }
+  // A capture confirmed only by webhook (API response was PENDING, or captured outside the app) still gets
+  // recorded on the invoice. recordCaptureOnInvoice() is idempotent, so the usual case is a no-op.
+  if (out.result === 'payment_confirmed') out.invoice = await recordCaptureOnInvoice(d, out.payment_id);
+  return out;
 }
 
 // Back-fill deliveries that reached the raw log while an older build was serving (idempotent).
@@ -818,10 +1050,12 @@ function renderDashboard(d, flash) {
     const bal = rp.amount_due_cents - rp.amount_paid_cents;
     const pct = Math.min(100, Math.round((rp.amount_paid_cents / rp.amount_due_cents) * 100));
     const payList = pays.filter((p) => p.status !== 'FAILED').map((p) =>
-      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}</li>`).join('');
+      `<li>${fmtDate(p.paid_at || p.created_at)} · ${money(p.amount_cents)} card${p.plan_id ? ` · plan #${p.plan_id} inst. ${p.plan_installment}` : ''} · ${p.status === 'COMPLETED' ? (p.webhook_event_id || p.invoice_webhook_event_id ? '<span class="ok-ic">✓</span> PayPal confirmed' : 'captured, awaiting webhook') : esc(p.status.toLowerCase())}${p.invoice_payment_id ? ` · on invoice (${esc(p.invoice_payment_id)})` : ''}</li>`).join('');
     return `<tr>
       <td><b>${esc(rp.unit_label)}</b><div class="small">${esc(rp.unit_address)}</div>
-        <a class="packet small" href="/api/rent-periods/${rp.id}/court-packet.pdf" title="Payment-history PDF from the ledger and PayPal records (not legal advice)">Download court packet (PDF)</a></td>
+        <a class="packet small" href="/api/rent-periods/${rp.id}/court-packet.pdf" title="Payment-history PDF from the ledger and PayPal records (not legal advice)">Download court packet (PDF)</a>
+        ${rp.paypal_invoice_id ? `<div class="small inv" title="The real PayPal invoice for this month (read back from PayPal after every change)">PayPal invoice <a href="${esc(rp.payer_view_url || '#')}" rel="noopener" target="_blank">${esc(rp.paypal_invoice_number)}</a> · <b>${esc(rp.paypal_invoice_status)}</b>
+          · ${rp.paypal_invoice_min_due_cents != null ? `partial OK, min ${money(rp.paypal_invoice_min_due_cents)}` : 'full amount'} · due ${esc(rp.paypal_invoice_due_date || '')}${rp.paypal_invoice_paid_cents ? ` · ${money(rp.paypal_invoice_paid_cents)} paid on invoice` : ''}</div>` : `<div class="small inv">No PayPal invoice yet</div>`}</td>
       <td>${esc(rp.tenant_name)}<div class="small">${esc(rp.tenant_email)}</div></td>
       <td class="num">${money(rp.amount_due_cents)}<div class="small">due ${fmtDate(rp.due_date)}</div></td>
       <td class="num">${money(rp.amount_paid_cents)}<div class="bar"><i style="width:${pct}%"></i></div>${bal > 0 && rp.amount_paid_cents > 0 ? `<div class="small">${money(bal)} left</div>` : ''}</td>
@@ -852,7 +1086,7 @@ function renderDashboard(d, flash) {
     <span class="small">Reads the live ledger: who owes what, days overdue, late-fee grace, and reminders already sent (max one per ${RATE_LIMIT_HOURS()} h per unchanged balance). Drafts are logged; no SMS/email integration yet.</span></div>
   <table><thead><tr><th>Unit</th><th>Tenant</th><th class="num">Due</th><th class="num">Paid</th><th>Status</th><th>Next action</th></tr></thead><tbody>${trs}</tbody></table>
   <h2>Ledger</h2><ul class="feed">${feed || '<li>No activity yet.</li>'}</ul>
-  <footer>Every payment and PayPal webhook is written to an append-only ledger. "Tenant pays" charges PayPal's sandbox test card. No real money moves.</footer>
+  <footer>Each month's rent is a real PayPal invoice; approving a plan rewrites that invoice's minimum amount due and due date. "Tenant pays" charges PayPal's sandbox test card through the Orders API and RentRoll records that capture on the invoice (record-payment). Every payment and PayPal webhook is written to an append-only ledger. No real money moves.</footer>
 </main></body></html>`;
 }
 
@@ -944,19 +1178,46 @@ function buildApp(d) {
     if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'plan id must be a positive integer');
     return id;
   };
+  // Sprint 10: after the local approval commits, the real PayPal invoice is rewritten (partial payment on,
+  // minimum_amount_due = next installment, due date = its date) and read back. Cancelling an approved plan turns
+  // partial payment off again. If PayPal refuses, the plan stays approved locally and the response says so.
+  const approveAndInvoice = async (d_, id) => {
+    const r = approvePlan(d_, id);
+    return { ...r, invoice: await syncInvoiceTerms(d_, r.plan.rent_period_id, { reason: `plan #${id} approved` }) };
+  };
+  const rejectAndInvoice = async (d_, id) => {
+    const wasApproved = d_.prepare('SELECT status FROM plan WHERE id=?').get(id)?.status === 'approved';
+    const r = rejectPlan(d_, id);
+    return wasApproved ? { ...r, invoice: await syncInvoiceTerms(d_, r.plan.rent_period_id, { reason: `plan #${id} cancelled` }) } : r;
+  };
+  const invMsg = (r) => (!r.invoice ? '' : r.invoice.ok && r.invoice.after
+    ? ` PayPal invoice ${r.invoice.invoice_number} updated: ${r.invoice.after.allow_partial_payment ? `minimum amount due ${money(r.invoice.after.minimum_amount_due_cents)}` : 'partial payment off'}, due ${r.invoice.after.due_date}.`
+    : ` PayPal invoice NOT updated: ${r.invoice.error || r.invoice.skipped}.`);
   for (const [verb, fn, okMsg] of [
-    ['approve', approvePlan, (r) => `Plan #${r.plan.id} approved. The tenant can now only pay installment 1: ${money(r.plan.installments[0].amount_cents)}.`],
-    ['reject', rejectPlan, (r) => `Plan #${r.plan.id} rejected.`],
+    ['approve', approveAndInvoice, (r) => `Plan #${r.plan.id} approved. The tenant can now only pay installment 1: ${money(r.plan.installments[0].amount_cents)}.${invMsg(r)}`],
+    ['reject', rejectAndInvoice, (r) => `Plan #${r.plan.id} rejected.${invMsg(r)}`],
   ]) {
-    app.post(`/api/plans/:id/${verb}`, (req, res) => {
-      try { res.json({ ok: true, ...fn(d, planId(req)) }); }
+    app.post(`/api/plans/:id/${verb}`, async (req, res) => {
+      try { res.json({ ok: true, ...(await fn(d, planId(req))) }); }
       catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
     });
-    app.post(`/plans/:id/${verb}`, (req, res) => {
-      try { res.redirect(303, `/?ok=${encodeURIComponent(okMsg(fn(d, planId(req))))}`); }
+    app.post(`/plans/:id/${verb}`, async (req, res) => {
+      try { res.redirect(303, `/?ok=${encodeURIComponent(okMsg(await fn(d, planId(req))))}`); }
       catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
     });
   }
+  // Sprint 10: the live PayPal invoice behind a rent period (GET from PayPal, mirror refreshed).
+  app.get('/api/rent-periods/:id/invoice', async (req, res) => {
+    try {
+      const rp = getPeriod(d, Number(req.params.id));
+      if (!rp) throw new HttpError(404, 'rent period not found');
+      if (!rp.paypal_invoice_id) throw new HttpError(404, 'this rent period has no PayPal invoice yet');
+      const inv = await getInvoice(rp.paypal_invoice_id);
+      const f = invoiceFacts(inv);
+      tx(d, () => saveInvoiceMirror(d, rp.id, f));
+      res.json({ ok: true, invoice: f, configuration: inv.configuration, payment_term: inv.detail?.payment_term, payments: inv.payments ?? null });
+    } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+  });
 
   // Sprint 4: reminder escalation check. JSON API (?dry_run=1 computes the decisions without drafting/logging).
   app.post('/api/reminders/run', async (req, res) => {
@@ -971,19 +1232,31 @@ function buildApp(d) {
     } catch (e) { res.redirect(303, `/?err=${encodeURIComponent(e.message)}`); }
   });
   // Sprint 6: court packet (read-only). .json is the exact data the PDF is rendered from.
-  const packet = (req) => {
+  // Sprint 10: the packet cites the real PayPal invoice, read live from PayPal at generation time (falls back to
+  // the last mirrored state, clearly labelled, if PayPal can't be reached).
+  const packet = async (req) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'rent period id must be a positive integer');
-    const data = courtPacketData(d, id, { getPeriod, activePlanRow, planSchedule, today });
-    if (!data) throw new HttpError(404, `rent period ${id} not found`);
-    return data;
+    const rp = getPeriod(d, id);
+    if (!rp) throw new HttpError(404, `rent period ${id} not found`);
+    let invoice = null;
+    if (rp.paypal_invoice_id) {
+      try { invoice = { ...invoiceFacts(await getInvoice(rp.paypal_invoice_id)), source: 'read live from PayPal', read_at: new Date().toISOString() }; }
+      catch (e) {
+        invoice = { id: rp.paypal_invoice_id, number: rp.paypal_invoice_number, status: rp.paypal_invoice_status, paid_cents: rp.paypal_invoice_paid_cents,
+          due_cents: rp.paypal_invoice_due_cents, minimum_amount_due_cents: rp.paypal_invoice_min_due_cents, allow_partial_payment: rp.paypal_invoice_min_due_cents != null,
+          due_date: rp.paypal_invoice_due_date, payer_view_url: rp.payer_view_url, transactions: null,
+          source: `last state RentRoll read from PayPal (live read failed: ${e.message})`, read_at: rp.paypal_invoice_synced_at };
+      }
+    }
+    return courtPacketData(d, id, { getPeriod, activePlanRow, planSchedule, today, invoice });
   };
-  app.get('/api/rent-periods/:id/court-packet.json', (req, res) => {
-    try { res.json(packet(req)); } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
+  app.get('/api/rent-periods/:id/court-packet.json', async (req, res) => {
+    try { res.json(await packet(req)); } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.message }); }
   });
   app.get('/api/rent-periods/:id/court-packet.pdf', async (req, res) => {
     try {
-      const data = packet(req);
+      const data = await packet(req);
       const pdf = await renderCourtPacketPdf(data);
       const name = `rentroll-${data.property.unit.replace(/[^A-Za-z0-9]+/g, '-').toLowerCase()}-${data.rent_period.period}-payment-record.pdf`;
       res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store' }).send(pdf);
@@ -1022,6 +1295,13 @@ if (args.includes('--seed')) {
   const n = seed(d);
   console.log(n ? `seeded ${n} units into ${DB_PATH}` : `already seeded (${DB_PATH}); add --reset to start over`);
   for (const r of currentPeriods(d)) console.log(`  rent_period ${r.id}: ${r.unit_label} / ${r.tenant_name} / ${r.period} / ${money(r.amount_due_cents)} / ${r.status}`);
+  if (INVOICING_ON && !args.includes('--no-invoices')) for (const r of await ensureInvoices(d)) console.log('  invoice', JSON.stringify(r));
+} else if (args.includes('--ensure-invoices')) {
+  const d = openDb();
+  for (const r of await ensureInvoices(d)) console.log(JSON.stringify(r));
+} else if (args.includes('--open-month')) {
+  const d = openDb();
+  console.log(JSON.stringify(await openMonth(d, args[args.indexOf('--open-month') + 1])));
 } else if (args.includes('--ingest-webhook-log')) {
   const d = openDb();
   seed(d);
@@ -1031,7 +1311,9 @@ if (args.includes('--seed')) {
   if (seed(d)) console.log('empty database: seeded demo data');
   buildApp(d).listen(PORT, HOST, () => {
     console.log(`rentroll listening on http://${HOST}:${PORT} (db ${DB_PATH})`);
-    ingestWebhookLog(d).then((rs) => {
+    // Sprint 10: every rent period gets a real PayPal invoice (back-fills periods created before Invoicing worked).
+    (INVOICING_ON ? ensureInvoices(d) : Promise.resolve([])).then((rs) => rs.forEach((r) => console.log('[invoice]', JSON.stringify(r))))
+      .then(() => ingestWebhookLog(d)).then((rs) => {
       const n = rs.filter((r) => r.result !== 'duplicate').length;
       if (n) console.log(`[webhook] back-filled ${n} logged deliveries`);
     }).catch((e) => console.error('[webhook] back-fill failed:', e.message));
