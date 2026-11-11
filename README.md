@@ -2,7 +2,7 @@
 
 ![RentRoll](docs/images/hero.jpg)
 
-🏆 Entry for the [PayPal AI Hackathon 2026](https://paypalaihackathon.devpost.com/) on Devpost · [Demo video](https://youtu.be/Eo3NTko7bwI)
+Entry for the [PayPal AI Hackathon 2026](https://paypalaihackathon.devpost.com/) on Devpost · [Demo video](https://youtu.be/Eo3NTko7bwI)
 
 Rent collection for landlords with one to four units who take rent over PayPal, Venmo or Zelle and check by hand every month who has paid.
 
